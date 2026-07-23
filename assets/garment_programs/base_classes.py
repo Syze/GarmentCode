@@ -109,6 +109,23 @@ class BaseBottoms(pyg.Component):
         self_adj_back_waist = pyg.utils.lin_interpolation(
             self.body['hip_back_width'], self.body['waist_back_width'], width_factor)
 
+        # Band-match: when the waistband is drafted to a production waist LARGER
+        # than the body-interpolated width (oversized/relaxed fits), widen the
+        # garment's top edge to match the band, like real jean construction
+        # (band sewn 1:1, no gathered seam). Otherwise the band is sewn onto a
+        # tube up to ~9cm smaller than itself and the excess circumference
+        # stands off the body as a permanent waist gap (verified on the
+        # HM_Jeans big-waist group; all POMs stay GT). No-op when the
+        # production waist <= the interpolated width (all normal/under-drafted
+        # garments) or when no waistband is defined.
+        try:
+            band = self.design['waistband']['waist']['v'] * self.body['waist']
+        except (KeyError, TypeError):
+            band = None
+        if band and band > self.adj_waist:
+            self_adj_back_waist *= band / self.adj_waist
+            self.adj_waist = band
+
         return self.adj_waist, self.adj_hips_depth, self_adj_back_waist
 
 class StackableSkirtComponent(BaseBottoms):

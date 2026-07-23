@@ -1169,6 +1169,7 @@ def _apply_pose_x_rotation(folder, body_obj_path,
                            top_band_height=15.0,
                            top_band_offset_below_crotch=15.0,
                            bot_band_height=20.0,
+                           bot_band_floor=0.0,
                            min_angle_deg=0.5,
                            back_rise_lift=0.0,
                            extra_x_sep=0.0):
@@ -1212,7 +1213,14 @@ def _apply_pose_x_rotation(folder, body_obj_path,
 
     top_band = (leg_top_y - top_band_offset_below_crotch - top_band_height,
                 leg_top_y - top_band_offset_below_crotch)
-    bot_band = (max(0.0, leg_bot_y), leg_bot_y + bot_band_height)
+    # Sample the body at a fixed floor-relative SHIN band, NOT tracking the
+    # garment hem. When a garment is too long for a short body, its hem drops
+    # below the floor, which used to push this band down onto the FEET -- and
+    # this A-pose body's feet splay ~8-9cm outboard of the shin, so the leg got
+    # aimed at the splayed foot and (especially for skinny cuts) wrapped outside
+    # the body leg. A fixed shin band tracks the actual lower leg for every
+    # body/garment, so theta aims the leg at the leg, not the foot.
+    bot_band = (bot_band_floor, bot_band_floor + bot_band_height)
 
     body_top_L, body_top_R = _body_leg_x_centers(body_obj_path, *top_band)
     body_bot_L, body_bot_R = _body_leg_x_centers(body_obj_path, *bot_band)
