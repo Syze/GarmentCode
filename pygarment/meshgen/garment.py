@@ -1,5 +1,7 @@
+import contextlib
 import igl
 import json
+import os
 import pickle
 import numpy as np
 import yaml
@@ -154,12 +156,16 @@ class Cloth:
         if auto_enabled and auto_clearance > 0:
             cloth_min_y = float(cloth_vertices[:, 1].min())
             if cloth_min_y < 0:
-                with open(self.paths.in_body_mes, 'r') as _bf:
-                    bd = yaml.safe_load(_bf)['body']
-                wl = bd.get('_waist_level',
-                            bd['height'] - bd['head_l'] - bd['waist_line'])
-                body_crotch_Y = self._crotch_y_smpl_or(
-                    wl - bd.get('hips_line', 22.0) - bd.get('crotch_hip_diff', 8.0))
+                # SMPL landmark needs no measurements; the yaml-based waist
+                # formula is only the fallback for non-SMPL bodies.
+                body_crotch_Y = self._crotch_y_smpl_or(None)
+                if body_crotch_Y is None:
+                    with open(self.paths.in_body_mes, 'r') as _bf:
+                        bd = yaml.safe_load(_bf)['body']
+                    wl = bd.get('_waist_level',
+                                bd['height'] - bd['head_l'] - bd['waist_line'])
+                    body_crotch_Y = (wl - bd.get('hips_line', 22.0)
+                                     - bd.get('crotch_hip_diff', 8.0))
                 mask = cloth_vertices[:, 1] < body_crotch_Y
                 if mask.any():
                     vy_min = cloth_vertices[mask, 1].min()
@@ -173,12 +179,12 @@ class Cloth:
                                 auto_clearance
                                 + (compressed[mask, 1] - vy_min) * ratio)
                             self._compressed_initial_q = compressed
-                            print(f'  AUTO PRE-LIFT: hem at Y={vy_min:.2f} '
-                                  f'below floor — initial-state remap of '
-                                  f'{mask.sum()} verts in '
-                                  f'[{vy_min:.1f}, {body_crotch_Y:.1f}] -> '
-                                  f'[{auto_clearance:.1f}, {body_crotch_Y:.1f}] '
-                                  f'(compression {1-ratio:.0%}); rest lengths natural')
+                            # print(f'  AUTO PRE-LIFT: hem at Y={vy_min:.2f} '
+                            #       f'below floor — initial-state remap of '
+                            #       f'{mask.sum()} verts in '
+                            #       f'[{vy_min:.1f}, {body_crotch_Y:.1f}] -> '
+                            #       f'[{auto_clearance:.1f}, {body_crotch_Y:.1f}] '
+                            #       f'(compression {1-ratio:.0%}); rest lengths natural')
 
         self.v_cloth_init = cloth_vertices
         self.f_cloth = cloth_faces
@@ -297,15 +303,17 @@ class Cloth:
 
 
         # Cloth-body segemntation
-        cloth_reference_labels, body_parts = assign.panel_assignment(
-                        cloth_seg_dict, cloth_vertices, cloth_indices, wp.transform(cloth_pos, cloth_rot), 
-                        body_seg, body_vertices, body_indices, wp.transform(body_pos, body_rot), 
-                        device=self.device,
-                        panel_init_labels=self._load_panel_labels(),
-                        strategy='closest', 
-                        merge_two_legs=True,
-                        smpl_body=self.paths.use_smpl_seg
-                        )  
+        # (stdout silenced: panel_assignment prints every panel:label pair)
+        with open(os.devnull, 'w') as devnull, contextlib.redirect_stdout(devnull):
+            cloth_reference_labels, body_parts = assign.panel_assignment(
+                            cloth_seg_dict, cloth_vertices, cloth_indices, wp.transform(cloth_pos, cloth_rot),
+                            body_seg, body_vertices, body_indices, wp.transform(body_pos, body_rot),
+                            device=self.device,
+                            panel_init_labels=self._load_panel_labels(),
+                            strategy='closest',
+                            merge_two_legs=True,
+                            smpl_body=self.paths.use_smpl_seg
+                            )
         
         face_filters, particle_filter = [], []
         if config.enable_body_collision_filters:
@@ -553,8 +561,6 @@ class Cloth:
                     print(f'{self.name}::WARNING::Requested attachment label {attach_label} '
                           'is not supported. Skipped')
                     continue
-                    
-                print(f'Using attachment for {attach_label} with {len(constaint_verts)} vertices')
 
         if not lables_present:
             # Loaded garment is not labeled -- update config

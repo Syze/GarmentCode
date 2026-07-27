@@ -225,9 +225,10 @@ class Properties():
                 'stats': kwstats
             }
             return
-        # section exists
+        # section exists (may lack 'stats' when loaded from a config-only file)
+        stats = self.properties[section].setdefault('stats', {})
         for key, value in kwstats.items():
-            self.properties[section]['stats'][key] = value
+            stats[key] = value
 
     def clean_stats(self, properties):
         """ Remove info from all Stats sub sections """

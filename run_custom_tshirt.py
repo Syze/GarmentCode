@@ -251,7 +251,7 @@ def simulate_pattern(pattern_folder, garment_name, output_base, sim_props=None):
     )
 
     props.serialize(paths.element_sim_props)
-    print(f'  Simulation complete: {in_name} -> {paths.out_el}')
+    #print(f'  Simulation complete: {in_name} -> {paths.out_el}')
     return paths.out_el
 
 
@@ -630,7 +630,7 @@ def save_combined_mesh(sim_folder,
         for face in garm_f_offset:
             f.write(f"f {face[0]+1} {face[1]+1} {face[2]+1}\n")
 
-    print(f'  Combined mesh saved to {output_path}')
+    #print(f'  Combined mesh saved to {output_path}')
 
     # Also save GLB
     body.visual = trimesh.visual.ColorVisuals(
@@ -642,7 +642,7 @@ def save_combined_mesh(sim_folder,
     scene.add_geometry(garment, node_name='garment')
     glb_path = sim_folder / 'combined.glb'
     scene.export(str(glb_path))
-    print(f'  Combined GLB saved to {glb_path}')
+    #print(f'  Combined GLB saved to {glb_path}')
 
 
 # ============================================================

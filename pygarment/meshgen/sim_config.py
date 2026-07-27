@@ -57,11 +57,12 @@ class PathCofig:
             self.in_body_mes = self.bodies_path / f'{self._body_name}.yaml'
         else:
             self.in_body_mes = self.input / 'body_measurements.yaml'
-        
-        with open(self.in_body_mes, 'r') as file:
-            body_dict = yaml.load(file, Loader=yaml.SafeLoader)
-        if 'body_sample' in body_dict['body']:   # Not present in default measurements
-            self._body_name = body_dict['body']['body_sample']
+            # Sampled measurements carry the name of the mesh they were
+            # measured from ('body_sample'); default bodies don't.
+            with open(self.in_body_mes, 'r') as file:
+                body_dict = yaml.load(file, Loader=yaml.SafeLoader)
+            if 'body_sample' in body_dict['body']:
+                self._body_name = body_dict['body']['body_sample']
 
         self.in_body_obj = self.bodies_path / f'{self._body_name}.obj'
         self.in_g_spec = self.input / f'{self.in_tag}_specification.json'

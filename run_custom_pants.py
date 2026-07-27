@@ -1046,125 +1046,6 @@ def _body_leg_x_centers(body_obj_path, y_lo, y_hi, lateral_min=0.5):
     return sum(left_xs) / len(left_xs), sum(right_xs) / len(right_xs)
 
 
-def _panel_world_vertices(panel):
-    """Return panel 2D vertices transformed into 3D world coords.
-
-    Spec stores panel vertices in panel-local 2D coords plus a rotation_zyx
-    (Euler angles in degrees) and translation. World vertex = R(zyx) * (vx, vy, 0)
-    + translation.
-    """
-    import numpy as np
-    verts2d = np.array(panel.get('vertices') or [], dtype=float)
-    if len(verts2d) == 0:
-        return None
-    verts3d_local = np.column_stack([verts2d, np.zeros(len(verts2d))])
-    rz, ry, rx = (np.deg2rad(a) for a in panel.get('rotation', [0, 0, 0]))
-    cz, sz = np.cos(rz), np.sin(rz)
-    cy, sy = np.cos(ry), np.sin(ry)
-    cx, sx = np.cos(rx), np.sin(rx)
-    Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
-    Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
-    Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
-    return (verts3d_local @ (Rz @ Ry @ Rx).T) + np.array(panel['translation'], dtype=float)
-
-
-def _garment_leg_y_band(spec):
-    """Compute a dynamic Y band [hem_Y, knee_Y] in world coords from the pant
-    panel vertices. Hem = lowest distinct Y level on the panels; Knee = the
-    next-lowest level (the knee corner of the design). Returns (None, None) if
-    the panels can't be parsed.
-    """
-    panels = spec.get('pattern', {}).get('panels', {})
-    needed = ['pant_f_l', 'pant_b_l', 'pant_f_r', 'pant_b_r']
-    if not all(n in panels for n in needed):
-        return None, None
-    hem_world_Ys, knee_world_Ys = [], []
-    for name in needed:
-        v = _panel_world_vertices(panels[name])
-        if v is None: continue
-        ys_sorted = sorted(set(round(float(y), 2) for y in v[:, 1]))
-        if len(ys_sorted) < 2: continue
-        hem_world_Ys.append(ys_sorted[0])
-        knee_world_Ys.append(ys_sorted[1])
-    if not hem_world_Ys or not knee_world_Ys:
-        return None, None
-    return min(hem_world_Ys), max(knee_world_Ys)
-
-
-def _garment_leg_x_centers(spec, y_lo, y_hi):
-    """Mean X of the pant_f_l + pant_b_l 3D vertices (and same for _r) in the
-    given world Y band. Returns (left_x, right_x) in cm."""
-    import numpy as np
-    panels = spec.get('pattern', {}).get('panels', {})
-    needed = ['pant_f_l', 'pant_b_l', 'pant_f_r', 'pant_b_r']
-    if not all(n in panels for n in needed):
-        return None, None
-    Lxs, Rxs = [], []
-    for name in needed:
-        v = _panel_world_vertices(panels[name])
-        if v is None: continue
-        v = v[(v[:, 1] >= y_lo) & (v[:, 1] <= y_hi)]
-        if len(v) == 0: continue
-        (Lxs if name.endswith('_l') else Rxs).extend(v[:, 0].tolist())
-    if not Lxs or not Rxs:
-        return None, None
-    return float(np.mean(Lxs)), float(np.mean(Rxs))
-
-
-def _apply_pose_x_correction(folder, body_obj_path,
-                             asymmetry_threshold=5.0, max_shift=3.0):
-    """Align both pant legs toward their body legs when the body has asymmetric
-    leg placement. Each leg's shift is clamped to ±max_shift cm. Symmetric
-    bodies (|body_L|-|body_R| under threshold) are a no-op.
-    """
-    spec_path = next(Path(folder).glob('*_specification.json'))
-    with open(spec_path) as f:
-        spec = json.load(f)
-
-    # Derive the calf/ankle Y band dynamically from the garment's hem and knee
-    # corners. This adapts to whatever ankle_clearance_pct is in effect.
-    band = _garment_leg_y_band(spec)
-    if band is None or band[0] is None:
-        print('  Pose-X correction skipped (could not derive Y band from panels)')
-        return
-    y_lo, y_hi = band
-
-    body_l, body_r = _body_leg_x_centers(body_obj_path, y_lo, y_hi)
-    if body_l is None or body_r is None:
-        print(f'  Pose-X correction skipped (no body leg verts in Y band [{y_lo:.1f},{y_hi:.1f}])')
-        return
-
-    asym = abs(body_l) - abs(body_r)
-    print(f'  Pose-X: Y band=[{y_lo:.2f}, {y_hi:.2f}]  body legs L={body_l:+.2f} R={body_r:+.2f}  '
-          f'asymmetry(|L|-|R|)={asym:+.2f}cm')
-
-    if abs(asym) < asymmetry_threshold:
-        print(f'    |asymmetry| < {asymmetry_threshold}cm threshold; no shift.')
-        return
-
-    garm_l, garm_r = _garment_leg_x_centers(spec, y_lo, y_hi)
-    if garm_l is None or garm_r is None:
-        print('    skipped (could not compute garment leg X)')
-        return
-
-    raw_l = body_l - garm_l
-    raw_r = body_r - garm_r
-    shift_l = max(-max_shift, min(max_shift, raw_l))
-    shift_r = max(-max_shift, min(max_shift, raw_r))
-    print(f'    garment legs L={garm_l:+.2f} R={garm_r:+.2f}  '
-          f'raw shifts L={raw_l:+.2f} R={raw_r:+.2f}  capped L={shift_l:+.2f} R={shift_r:+.2f}')
-
-    panels = spec['pattern']['panels']
-    # Include each leg's cuff panels so the cuff shifts with its leg.
-    for name in ['pant_f_l', 'pant_b_l'] + [n for n in panels if 'l_cuff' in n]:
-        if name in panels: panels[name]['translation'][0] += shift_l
-    for name in ['pant_f_r', 'pant_b_r'] + [n for n in panels if 'r_cuff' in n]:
-        if name in panels: panels[name]['translation'][0] += shift_r
-
-    with open(spec_path, 'w') as f:
-        json.dump(spec, f, indent=2)
-
-
 def _apply_pose_x_rotation(folder, body_obj_path,
                            top_band_height=15.0,
                            top_band_offset_below_crotch=15.0,
@@ -1228,9 +1109,9 @@ def _apply_pose_x_rotation(folder, body_obj_path,
         print(f'  Pose-X-Rot skipped (no body leg samples; top band={top_band}, bot band={bot_band})')
         return
 
-    print(f'  Pose-X-Rot: leg_top_y={leg_top_y:.2f} leg_bot_y={leg_bot_y:.2f} leg_len={leg_length:.2f}')
-    print(f'    body top band Y=[{top_band[0]:.2f}, {top_band[1]:.2f}]  L={body_top_L:+.2f} R={body_top_R:+.2f}')
-    print(f'    body bot band Y=[{bot_band[0]:.2f}, {bot_band[1]:.2f}]  L={body_bot_L:+.2f} R={body_bot_R:+.2f}')
+    # print(f'  Pose-X-Rot: leg_top_y={leg_top_y:.2f} leg_bot_y={leg_bot_y:.2f} leg_len={leg_length:.2f}')
+    # print(f'    body top band Y=[{top_band[0]:.2f}, {top_band[1]:.2f}]  L={body_top_L:+.2f} R={body_top_R:+.2f}')
+    # print(f'    body bot band Y=[{bot_band[0]:.2f}, {bot_band[1]:.2f}]  L={body_bot_L:+.2f} R={body_bot_R:+.2f}')
 
     def pivot_x_for_leg(panel_names):
         # Average X over the panel's full top (waist) edge. The back-rise scoop
@@ -1296,17 +1177,17 @@ def _apply_pose_x_rotation(folder, body_obj_path,
         sep = max(0.0, (overlap + extra_x_sep) / 2.0)
         shift_L += math.copysign(sep, body_top_L)
         shift_R += math.copysign(sep, body_top_R)
-        print(f'    adaptive x-sep: max fly/CB overlap={overlap:+.2f} '
-              f'-> sep=±{sep:.2f} (target gap {extra_x_sep})')
+    # print(f'    adaptive x-sep: max fly/CB overlap={overlap:+.2f} '
+    # f'-> sep=±{sep:.2f} (target gap {extra_x_sep})')
 
-    print(f'    garment pivots L={pivot_L_x:+.2f} R={pivot_R_x:+.2f}  pivot_y={pivot_y:.2f}')
-    print(f'    shifts L={shift_L:+.2f} R={shift_R:+.2f}')
-    print(f'    angles L={math.degrees(theta_L):+.2f}° R={math.degrees(theta_R):+.2f}°')
+    # print(f'    garment pivots L={pivot_L_x:+.2f} R={pivot_R_x:+.2f}  pivot_y={pivot_y:.2f}')
+    # print(f'    shifts L={shift_L:+.2f} R={shift_R:+.2f}')
+    # print(f'    angles L={math.degrees(theta_L):+.2f}° R={math.degrees(theta_R):+.2f}°')
 
     if not extra_x_sep \
             and abs(math.degrees(theta_L)) < min_angle_deg and abs(math.degrees(theta_R)) < min_angle_deg \
             and abs(shift_L) < 0.5 and abs(shift_R) < 0.5:
-        print('    below min thresholds; no transform applied')
+    # print('    below min thresholds; no transform applied')
         return
 
     def apply_rigid(panel, shift_x, theta, pivot_x_world):
@@ -1373,9 +1254,8 @@ def _body_crotch_Y(body, body_yaml_path):
     If the body mesh is SMPL (6890 verts) use the crotch landmark vertex 1210 --
     pose-invariant and accurate. Otherwise fall back to the measurement formula,
     which underestimates the true SMPL crotch by a height-dependent ~3-4.5cm.
+    (The formula is evaluated lazily so SMPL bodies work without a yaml.)
     """
-    formula = (body['height'] - body['head_l'] - body['waist_line']
-               - body['hips_line']) - body['crotch_hip_diff']
     obj = Path(str(body_yaml_path).replace('.yaml', '.obj'))
     if obj.exists():
         try:
@@ -1387,7 +1267,8 @@ def _body_crotch_Y(body, body_yaml_path):
                 return float((V[SMPL_CROTCH_VERTEX, 1] - V[:, 1].min()) * scale)
         except Exception:
             pass
-    return formula
+    return (body['height'] - body['head_l'] - body['waist_line']
+            - body['hips_line']) - body['crotch_hip_diff']
 
 
 def generate_pattern(size, design, body_yaml_path, output_base, name_prefix='',
@@ -1430,21 +1311,22 @@ def generate_pattern(size, design, body_yaml_path, output_base, name_prefix='',
     band_width = (design.get('waistband', {}).get('width', {}).get('v', 0.0)
                   * body['hips_line'])
 
-    # Lift to put the garment crotch at body_crotch_Y + CROTCH_TARGET_OFFSET.
-    # Measure the actual as-built crotch Y from the garment (min Y of the
-    # crotch interfaces) rather than assuming it sits at body_crotch - band -5
-    # (that assumption was ~10cm off, so the offset never hit its target).
-    body_crotch_Y = _body_crotch_Y(body, body_yaml_path)
+    # Canonical, body-agnostic placement: serialize with the garment crotch at
+    # exactly Y=0. The body-specific lift (crotch height + offset) and the
+    # pose-X leg alignment are deferred to sim time, applied against the
+    # actual sim body (_place_pattern_for_body), so one generated pattern
+    # drapes onto any body.
     as_built_crotch_Y = _garment_crotch_Y(garment)
-    if as_built_crotch_Y is not None:
-        lift = (body_crotch_Y + CROTCH_TARGET_OFFSET) - as_built_crotch_Y
+    body_agnostic = as_built_crotch_Y is not None
+    if body_agnostic:
+        lift = -as_built_crotch_Y
     else:
-        # Fallback to the legacy (approximate) formula if the crotch interface
-        # can't be located (e.g. non-pants lower garments).
+        # Legacy body-baked fallback when the crotch interface can't be
+        # located (e.g. non-pants lower garments).
         lift = band_width + 5.0 + CROTCH_TARGET_OFFSET
 
     print(f'  anchor_mode=crotch_zero  band_width={band_width:.2f}  '
-          f'applied_lift={lift:.2f}')
+          f'applied_lift={lift:.2f}  body_agnostic={body_agnostic}')
     if lift != 0.0:
         garment.translate_by([0, lift, 0])
 
@@ -1463,9 +1345,7 @@ def generate_pattern(size, design, body_yaml_path, output_base, name_prefix='',
         with_printable=True
     )
 
-    # Adjust panel X-translations so each pant leg lands on its corresponding
-    # body leg, handling asymmetric body poses. Auto-detects the asymmetry; for
-    # symmetric bodies the threshold check inside makes this a no-op.
+    # Pose hints consumed by the sim-time pose-X leg alignment.
     # Extra leg X-separation for the next.dxf PantsCLO path: its DXF front-crotch
     # hook is deep enough that the two legs' fly edges overlap ~11cm at init.
     # `clo_dxf.x_sep` (a profile-supplied half-distance) clears it; absent/zero
@@ -1477,24 +1357,88 @@ def generate_pattern(size, design, body_yaml_path, output_base, name_prefix='',
         if _dxf_path:
             from assets.garment_programs.pants_clo import _profile
             _xsep = float(_profile(_dxf_path).get('x_sep', 0.0) or 0.0)
+    _brl = (design['pants']['back_rise_lift']['v']
+            if isinstance(design.get('pants', {}).get('back_rise_lift'), dict)
+            and design['pants']['back_rise_lift'].get('v') is not None
+            else 0.0)
 
-    body_obj = Path(str(body_yaml_path).replace('.yaml', '.obj'))
-    if body_obj.exists():
-        mode = os.environ.get('POSE_MODE', 'rotate')
-        _brl = (design['pants']['back_rise_lift']['v']
-                if isinstance(design.get('pants', {}).get('back_rise_lift'), dict)
-                and design['pants']['back_rise_lift'].get('v') is not None
-                else 0.0)
-        if mode == 'rotate':
+    if body_agnostic:
+        # Stamp the spec as canonically placed. Sim-time placement
+        # (_place_pattern_for_body) reads the anchor + pose hints and bakes
+        # the body-specific lift and leg alignment against the sim body.
+        spec_path = next(Path(folder).glob('*_specification.json'))
+        with open(spec_path) as f:
+            spec = json.load(f)
+        spec.setdefault('properties', {})['placement'] = {
+            'anchor': 'crotch_at_zero',
+            'back_rise_lift': _brl,
+            'extra_x_sep': _xsep,
+        }
+        with open(spec_path, 'w') as f:
+            json.dump(spec, f, indent=2)
+    else:
+        # Legacy path: bake pose-X against the drafting body at generation.
+        body_obj = Path(str(body_yaml_path).replace('.yaml', '.obj'))
+        if body_obj.exists():
             _apply_pose_x_rotation(folder, body_obj, back_rise_lift=_brl, extra_x_sep=_xsep)
         else:
-            max_shift_override = float(os.environ.get('MAX_SHIFT', '3.0'))
-            _apply_pose_x_correction(folder, body_obj, max_shift=max_shift_override)
-    else:
-        print(f'  Pose-X correction skipped (no body OBJ at {body_obj})')
+            print(f'  Pose-X correction skipped (no body OBJ at {body_obj})')
 
     print(f'  Pattern generated: {garment_name} -> {folder}')
     return Path(folder), garment_name
+
+
+def _place_pattern_for_body(spec_file, body_name, output_base, placement):
+    """Bake body-specific placement into a copy of a body-agnostic spec.
+
+    Canonical specs (generate_pattern) are serialized with the garment crotch
+    at exactly Y=0 and carry a properties.placement marker. This lifts all
+    panels so the crotch sits at body_crotch_Y + CROTCH_TARGET_OFFSET for THIS
+    body, then aligns the pant legs to the body legs (pose-X). The placed spec
+    is written to a per-run folder; the input pattern is never mutated.
+    Assumes the body OBJ has feet at Y=0 (normalize_body_mesh).
+    """
+    bodies = Path('./assets/bodies')
+    body_obj = bodies / f'{body_name}.obj'
+    body_yaml = bodies / f'{body_name}.yaml'
+    body = {}
+    if body_yaml.exists():
+        with open(body_yaml) as f:
+            body = yaml.safe_load(f)['body']
+    try:
+        body_crotch = _body_crotch_Y(body, body_yaml)
+    except KeyError:
+        raise RuntimeError(
+            f'Cannot place pattern: body {body_name} is not SMPL topology '
+            'and has no measurements yaml for the crotch formula')
+
+    spec_file = Path(spec_file)
+    in_name = spec_file.stem.replace('_specification', '')
+    placed_folder = Path(output_base) / f'{in_name}_placed'
+    placed_folder.mkdir(parents=True, exist_ok=True)
+
+    with open(spec_file) as f:
+        spec = json.load(f)
+    lift = body_crotch + CROTCH_TARGET_OFFSET
+    for panel in spec['pattern']['panels'].values():
+        panel['translation'][1] += lift
+    # Mark placement as baked so this spec (and the copy BoxMesh writes into
+    # the sim output folder) is never placed a second time when re-simulated.
+    spec['properties']['placement'] = dict(
+        placement, anchor='placed', placed_for_body=str(body_name))
+    with open(placed_folder / spec_file.name, 'w') as f:
+        json.dump(spec, f, indent=2)
+    print(f'  Placement: crotch lift {lift:.2f} for body {body_name} '
+          f'-> {placed_folder}')
+
+    if body_obj.exists():
+        _apply_pose_x_rotation(
+            placed_folder, body_obj,
+            back_rise_lift=float(placement.get('back_rise_lift', 0.0) or 0.0),
+            extra_x_sep=float(placement.get('extra_x_sep', 0.0) or 0.0))
+    else:
+        print(f'  Pose-X skipped (no body OBJ at {body_obj})')
+    return placed_folder
 
 
 def simulate_pattern(pattern_folder, garment_name, output_base,
@@ -1532,6 +1476,21 @@ def simulate_pattern(pattern_folder, garment_name, output_base,
     spec_file = spec_files[0]
     in_name = spec_file.stem.replace('_specification', '')
 
+    # Body-agnostic (canonical) specs defer placement to sim time: bake the
+    # crotch lift + pose-X leg alignment for THIS body into a per-run copy.
+    # Baked specs (no marker) simulate as-is, exactly as before.
+    try:
+        with open(spec_file) as f:
+            placement = json.load(f).get('properties', {}).get('placement')
+    except (OSError, json.JSONDecodeError):
+        placement = None
+    placed_folder = None
+    if placement and placement.get('anchor') == 'crotch_at_zero':
+        placed_folder = _place_pattern_for_body(
+            spec_file, body_name, output_base, placement)
+        pattern_folder = placed_folder
+        spec_file = pattern_folder / spec_file.name
+
     paths = PathCofig(
         in_element_path=pattern_folder,
         out_path=output_base,
@@ -1549,6 +1508,13 @@ def simulate_pattern(pattern_folder, garment_name, output_base,
         paths, store_panels=False,
         uv_config=props['render']['config']['uv_texture']
     )
+
+    # The placed copy has served its purpose: BoxMesh.serialize wrote the
+    # placed spec into the sim output folder (paths.g_specs), which is what
+    # the sim reads from here on.
+    if placed_folder is not None:
+        import shutil
+        shutil.rmtree(placed_folder, ignore_errors=True)
 
     props.serialize(paths.element_sim_props)
 
@@ -1579,7 +1545,7 @@ def simulate_pattern(pattern_folder, garment_name, output_base,
         save_combined_mesh(paths.out_el, body_name=body_name)
     except Exception as e:
         print(f'  Combined mesh skipped: {e}')
-    print(f'  Simulation complete: {in_name} -> {paths.out_el}')
+    #print(f'  Simulation complete: {in_name} -> {paths.out_el}')
     return paths.out_el
 
 
@@ -1895,7 +1861,7 @@ def save_combined_mesh(sim_folder, body_obj_path=None, body_name=None):
         for face in garm_f_offset:
             f.write(f"f {face[0]+1} {face[1]+1} {face[2]+1}\n")
 
-    print(f'  Combined mesh saved to {output_path}')
+    #print(f'  Combined mesh saved to {output_path}')
 
     body.visual = trimesh.visual.ColorVisuals(
         mesh=body, face_colors=np.tile([80, 80, 80, 255], (len(body.faces), 1)))
@@ -1906,7 +1872,7 @@ def save_combined_mesh(sim_folder, body_obj_path=None, body_name=None):
     scene.add_geometry(garment, node_name='garment')
     glb_path = sim_folder / 'combined.glb'
     scene.export(str(glb_path))
-    print(f'  Combined GLB saved to {glb_path}')
+    #print(f'  Combined GLB saved to {glb_path}')
 
 
 # ============================================================

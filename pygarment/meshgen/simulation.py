@@ -31,6 +31,10 @@ from pygarment.meshgen.render.pythonrender import render_images, render_frame_to
 from pygarment.meshgen.garment import Cloth
 from pygarment.meshgen.sim_config import SimConfig, PathCofig
 
+# Suppress warp's init banner and per-module load timing prints
+# ("Module warp.sim.X load on device 'cuda:0' took N ms")
+wp.config.quiet = True
+wp.config.verbose = False
 wp.init()
 
 class SimulationError(BaseException):
@@ -252,7 +256,7 @@ def save_video(frames, video_path, fps=30):
     for f in rgb_frames:
         writer.append_data(f)
     writer.close()
-    print(f"Simulation video saved: {video_path} ({len(frames)} frames)")
+    #print(f"Simulation video saved: {video_path} ({len(frames)} frames)")
 
 
 def run_sim(
@@ -281,7 +285,6 @@ def run_sim(
     video_frames = [] if save_sim_video else None
 
     try:
-        print("Simulation..")
         sim_frame_sequence(
             garment, config, store_usd, verbose=verbose,
             video_frames=video_frames,
@@ -336,13 +339,13 @@ def run_sim(
                   f'is fail: {num_self_collisions > config.max_self_collisions}')
             if num_self_collisions > config.max_self_collisions:
                 props.add_fail('sim', 'cloth_self_intersection', cloth_name)
-        else:
-            print('Not self-intersecting!!!')
+        # else:
+        #     print('Not self-intersecting!!!')
 
     # ---- Postprocessing ----
     # NOTE: Attempt even on failures for accurate picture and post-analysis
     frame = garment.frame
-    print(f"\nSimulation took #frames={frame + 1}")
+    print(f"Simulation took #frames={frame + 1}")
 
     sim_props['stats']['sim_time'][cloth_name] = sim_time = time.time() - start_time
     sim_props['stats']['spf'][cloth_name] = sim_time / frame if frame else sim_time
@@ -365,7 +368,7 @@ def run_sim(
     render_images(paths, garment.v_body, garment.f_body, render_props['config'])
     render_image_time = time.time() - s_time
     render_props['stats']['render_time'][cloth_name] = render_image_time  
-    print(f"Rendering {cloth_name} took {render_image_time}s")
+    #print(f"Rendering {cloth_name} took {render_image_time}s")
 
     # Save simulation video
     if video_frames:
@@ -385,6 +388,6 @@ def run_sim(
         optimize_garment_storage(paths)
 
     # Final info output
-    sec = round(time.time() - start_time, 3)
-    min = int(sec / 60)
-    print(f"\nSimulation pipeline took: {min} m {sec - min * 60} s")
+    # sec = round(time.time() - start_time, 3)
+    # min = int(sec / 60)
+    #print(f"Simulation pipeline took: {min} m {sec - min * 60} s")

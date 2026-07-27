@@ -35,5 +35,6 @@ output*
 assets/img
 assets/bodies
 assets/garment_configs
+assets/Patterns
 *.DS_Store
 .DS_Store

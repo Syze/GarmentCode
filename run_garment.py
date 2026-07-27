@@ -173,6 +173,12 @@ def run_pipeline(config):
         print("\n--- Step 2: Skipping measurement verification (not implemented for shirts) ---")
 
     # Step 3: Simulate
+    if config.get('generate_only'):
+        print("\n--- Step 3: Skipped (--generate-only); pattern folders kept ---")
+        for folder, name, size in generated:
+            print(f'  size {size}: {folder}')
+        return
+
     print("\n--- Step 3: Running simulations ---")
     sim_results = []
     for folder, name, size in generated:
@@ -253,6 +259,8 @@ if __name__ == '__main__':
     parser.add_argument('--garment-prefix', help='Override garment output prefix (replaces config value)', default=None)
     parser.add_argument('--repose-to', help='Target-pose body OBJ for post-sim re-pose (shirts only)', default=None)
     parser.add_argument('--sdf-push', action='store_true', help='After repose, push cloth verts inside the target body outward')
+    parser.add_argument('--generate-only', action='store_true',
+                        help='Stop after pattern generation + verification; keep the pattern folders (no simulation)')
     parser.add_argument('--edge-contact-mult', type=int, help='Multiply warp edge-edge contact buffer (per-spring) for heavy-self-contact barrels', default=None)
     args = parser.parse_args()
 
@@ -280,5 +288,7 @@ if __name__ == '__main__':
         config['repose_to'] = args.repose_to
     if args.sdf_push:
         config['sdf_push'] = True
+    if args.generate_only:
+        config['generate_only'] = True
 
     run_pipeline(config)
