@@ -17,8 +17,6 @@ Measurements from techpack:
   - Back rise: "Back rise"
 """
 import os
-os.environ.setdefault('CUDA_VISIBLE_DEVICES', '1')
-
 from pathlib import Path
 from datetime import datetime
 import json

@@ -239,7 +239,12 @@ def sim_frame_sequence(garment, config, store_usd=False, verbose=False,
         
 
 def save_video(frames, video_path, fps=30):
-    """Save list of RGBA numpy arrays as an MP4 video."""
+    """Save list of RGBA numpy arrays as an MP4 video.
+
+    Best-effort: the video is a diagnostic nice-to-have, so encoding problems
+    (missing ffmpeg backend, PyAV plugin with a different kwargs contract, ...)
+    must never fail the simulation run.
+    """
     import imageio.v2 as imageio
 
     if not frames:
@@ -249,14 +254,23 @@ def save_video(frames, video_path, fps=30):
     # Convert RGBA to RGB for MP4
     rgb_frames = [f[:, :, :3] for f in frames]
 
-    writer = imageio.get_writer(
-        str(video_path), fps=fps, codec='libx264',
-        output_params=['-pix_fmt', 'yuv420p'],  # broad compatibility
-    )
-    for f in rgb_frames:
-        writer.append_data(f)
-    writer.close()
-    #print(f"Simulation video saved: {video_path} ({len(frames)} frames)")
+    def _write(**kwargs):
+        with imageio.get_writer(str(video_path), fps=fps, codec='libx264',
+                                **kwargs) as writer:
+            for f in rgb_frames:
+                writer.append_data(f)
+
+    try:
+        try:
+            # ffmpeg backend (imageio-ffmpeg): supports output_params
+            _write(output_params=['-pix_fmt', 'yuv420p'])  # broad compatibility
+        except TypeError:
+            # Other backends (e.g. PyAV) reject ffmpeg-specific kwargs,
+            # some only at write time -- retry the whole encode without them.
+            _write()
+    except Exception as e:
+        print(f'Simulation video skipped ({type(e).__name__}: {e})')
+        return
 
 
 def run_sim(

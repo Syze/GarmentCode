@@ -657,7 +657,9 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='GarmentCode draping inference server')
     parser.add_argument('--host', default='0.0.0.0')
     parser.add_argument('--port', type=int, default=8600)
-    parser.add_argument('--gpu', default='0', help='CUDA_VISIBLE_DEVICES value for sim worker processes')
+    parser.add_argument('--gpu', default=os.environ.get('CUDA_VISIBLE_DEVICES', '0'),
+                        help='CUDA_VISIBLE_DEVICES value for sim worker processes '
+                             '(defaults to the CUDA_VISIBLE_DEVICES the server was started with, else 0)')
     parser.add_argument('--smpl-models-dir', default=SERVER_CONFIG['smpl_models_dir'],
                         help='Directory with SMPL_FEMALE.pkl / SMPL_MALE.pkl')
     parser.add_argument('--smpl-poses-dir', default=SERVER_CONFIG['smpl_poses_dir'],
