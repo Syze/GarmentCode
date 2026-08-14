@@ -35,6 +35,16 @@ def euler_xyz_to_R(euler):
     """Convert to Rotation matrix.
         Expects input in degrees.
         Only support Maya convension of intrinsic xyz Euler Angles
+
+    CONVENTION MISMATCH (found 2026-08-06, not fixed here): this builds
+    Rz.Ry.Rx, which is scipy's EXTRINSIC 'xyz'. But the angles it is fed come
+    from Panel.assembly() (pygarment/garmentcode/panel.py), which serializes
+    scipy's INTRINSIC 'XYZ' -- the matrix Rx.Ry.Rz. Those are equal only for a
+    rotation about a single axis. Every panel in this repo is either unrotated
+    or single-axis, so nothing has ever hit it; a panel with a true 3-axis
+    rotation is meshed in the wrong orientation (a folded blazer lapel came out
+    mirrored across its hinge, ~24cm off). Either this function or the
+    serialization in Panel.assembly() is wrong -- they cannot both be right.
     """
     return _Rz(np.deg2rad(euler[2])) * _Ry(np.deg2rad(euler[1])) * _Rx(np.deg2rad(euler[0]))
 

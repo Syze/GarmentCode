@@ -395,6 +395,14 @@ class Cloth:
         if config.enable_attachment_constraint:
             self._add_attachment_labels(builder, config)
 
+        # ----- Panel-to-panel springs ("tacks") -----
+        # Opt-in, driven entirely by the pattern spec, so no existing garment is
+        # affected. add_attachment above pins particles to STATIC world points,
+        # which cannot hold one panel to another; a spring can, and its rest
+        # length is the frame-0 distance, so it preserves the relationship the
+        # pattern was built with (e.g. a pre-folded lapel staying folded).
+        self._add_panel_springs(builder)
+
         # ----- Global collision resolution error ---- 
         for part in body_parts:
             part_v, part_inds = assign.extract_submesh(body_vertices, body_indices, body_parts[part])
@@ -446,6 +454,94 @@ class Cloth:
         except Exception:
             pass
         return formula
+
+    def _add_panel_springs(self, builder):
+        """Spring pairs of labelled vertex sets together (panel-to-panel tacks).
+
+        Reads properties.panel_springs from the pattern spec:
+            [[label_a, label_b, ke, kd], ...]
+        where label_a/label_b are EDGE labels set by the garment program; each
+        vertex of set A is sprung to its nearest vertex in set B. Rest length is
+        the frame-0 separation, so the constraint holds the built geometry rather
+        than collapsing the two edges together the way a stitch would.
+        """
+        try:
+            with open(self.paths.g_specs) as f:
+                pairs = json.load(f).get('properties', {}).get('panel_springs')
+        except (OSError, ValueError):
+            return
+        if not pairs:
+            return
+        try:
+            with open(self.paths.g_vert_labels, 'r') as f:
+                vlabels = yaml.load(f, Loader=yaml.SafeLoader) or {}
+        except OSError:
+            return
+        q = np.asarray(builder.particle_q, dtype=float)
+        # Record where our springs start: builder.spring_indices already holds
+        # the cloth's own edge springs (add_cloth_mesh(add_springs=True)).
+        first = len(builder.spring_indices) // 2
+        total = 0
+        for entry in pairs:
+            la, lb = entry[0], entry[1]
+            ke = float(entry[2]) if len(entry) > 2 else 1.0e4
+            kd = float(entry[3]) if len(entry) > 3 else 1.0e1
+            # A label resolves from vertex_labels.yaml (edge labels) OR from the
+            # mesh segmentation (whole panels). Using a whole panel as the target
+            # set matters: paired against a sparse 9-vertex edge every spring
+            # collapsed onto the same few verts and fanned out; against the full
+            # panel each source vertex finds the vert directly beneath it, so the
+            # springs come out short and mutually parallel.
+            A = vlabels.get(la) or self.cloth_seg_dict.get(la) or []
+            B = vlabels.get(lb) or self.cloth_seg_dict.get(lb) or []
+            if not A or not B:
+                print(f'  Panel springs: skipped {la} <-> {lb} '
+                      f'(labelled verts {len(A)}/{len(B)})')
+                continue
+            Bq = q[B]
+            lens, targets = [], set()
+            for i in A:
+                j = B[int(np.argmin(np.linalg.norm(Bq - q[i], axis=1)))]
+                builder.add_spring(i, j, ke, kd, 0.0)
+                lens.append(float(np.linalg.norm(q[i] - q[j])))
+                targets.add(j)
+                total += 1
+            print(f'  Panel springs: {la} <-> {lb}, {len(A)} springs '
+                  f'(ke={ke:g}, kd={kd:g}) len {min(lens):.2f}-{max(lens):.2f}cm, '
+                  f'{len(targets)} distinct targets')
+        if total:
+            print(f'  Panel springs: {total} added')
+            self._dump_panel_springs(builder, q, first)
+
+    def _dump_panel_springs(self, builder, q, first=0):
+        """Append the springs to the BOXMESH as visible sliver triangles.
+
+        MeshLab (and most viewers) ignore OBJ `l` polyline elements, so a spring
+        written as `l i j` is invisible. Each spring is therefore written as a
+        degenerate-thin FACE `f i j k`, where k is an existing vertex near the
+        segment's midpoint. Both endpoints are cloth particles and particle index
+        == boxmesh vertex index, so no `v` lines are added: the vertex count, the
+        segmentation and the solver are all untouched. It does add one face per
+        spring to this output file (an artefact only -- boxmeshgen rewrites the
+        boxmesh from scratch on every run).
+        """
+        idx = np.asarray(builder.spring_indices, dtype=int).reshape(-1, 2)[first:]
+        if not len(idx):
+            return
+        try:
+            with open(self.paths.g_box_mesh, 'a') as f:
+                f.write('# panel-to-panel springs, one sliver face per spring\n')
+                for a, b in idx:
+                    a, b = int(a), int(b)
+                    mid = (q[a] + q[b]) / 2.0
+                    d = np.linalg.norm(q - mid, axis=1)
+                    d[a] = d[b] = np.inf
+                    c = int(np.argmin(d))
+                    f.write(f'f {a + 1} {b + 1} {c + 1}\n')
+            print(f'  Panel springs: {len(idx)} sliver faces appended to '
+                  f'{self.paths.g_box_mesh.name}')
+        except OSError as e:
+            print(f'  Panel springs: could not annotate boxmesh ({e})')
 
     def _add_attachment_labels(self, builder, config):
         with open(self.paths.in_body_mes, 'r') as file:

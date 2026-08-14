@@ -110,6 +110,18 @@ class Panel(BaseComponent):
             # FIXME Replicate rotation
 
         # UPD vertex locations relative to new pivot
+        # BUG (found 2026-08-06, not fixed here -- behaviour change would move
+        # every panel of every existing garment): the vertices are shifted by
+        # int() of the pivot while `translation` above is set from its EXACT
+        # value, so the panel is displaced in world by the FRACTIONAL part of
+        # point_2d (up to ~1cm per axis). Harmless-looking for an unrotated
+        # panel -- it is a constant offset -- but assembly() calls this on every
+        # panel, so a panel carrying a placement ROTATION has that offset rotated
+        # with it and drifts off its shared seams. Measured on a hinged blazer
+        # lapel: 0.23cm of seam gap unrotated, 1.22cm once folded 150 degrees.
+        # Workaround used by assets/garment_programs/hyperdrop.py: pre-shift the
+        # panel so edges[0].start is integral (or exactly (0, 0)), which makes
+        # the truncation exact and the displacement vanish.
         for v in self.edges.verts():
             v[0] -= int(point_2d[0])
             v[1] -= int(point_2d[1])
@@ -200,7 +212,14 @@ class Panel(BaseComponent):
                 specification
         """
         norm_dr = self.norm()
-        
+
+        # Fail loudly rather than silently skipping the flip: a non-finite normal used
+        # to make the comparison below False, leaving a mirrored panel inside-out.
+        if not np.all(np.isfinite(norm_dr)):
+            raise ValueError(
+                f'{self.name}::ERROR::panel normal is not finite ({norm_dr}); cannot '
+                'determine right/wrong side')
+
         # NOTE: Nothing happens if self.translation is zero
         if np.dot(norm_dr, self.translation) < 0: 
             # Swap if wrong  
@@ -277,10 +296,24 @@ class Panel(BaseComponent):
         self.set_pivot(self.edges[0].start, replicate_placement=True)
 
         # Basics
+        # BUG (found 2026-08-06, not fixed here): scipy's UPPERCASE 'XYZ' is the
+        # INTRINSIC convention, i.e. the matrix Rx.Ry.Rz. The consumer of this
+        # field, pygarment/meshgen/boxmeshgen.py, rebuilds it with
+        # pattern/rotation.py::euler_xyz_to_R, which is Rz.Ry.Rx -- scipy's
+        # LOWERCASE (extrinsic) 'xyz'. The two agree only when the rotation is
+        # about a single axis, which is true of every panel in this repo, so the
+        # mismatch has never surfaced. Give a panel a genuine 3-axis rotation and
+        # it is simulated in the wrong orientation: a blazer lapel folded about a
+        # diagonal roll line was written intending world x[-4.25, 11.50] and the
+        # boxmesh placed it at x[-27.72, -4.79], mirrored across the hinge.
+        # Correct serialization for the mesh path is
+        #     self.rotation.as_euler('xyz', degrees=True)
+        # See _rot_for_meshgen() in assets/garment_programs/hyperdrop.py, which
+        # works around it locally rather than changing this line for all garments.
         panel = Namespace(
             translation=self.translation.tolist(),
-            rotation=self.rotation.as_euler('XYZ', degrees=True).tolist(), 
-            vertices=[self.edges[0].start], 
+            rotation=self.rotation.as_euler('XYZ', degrees=True).tolist(),
+            vertices=[self.edges[0].start],
             edges=[])
 
         for i in range(len(self.edges)):
@@ -366,8 +399,24 @@ class Panel(BaseComponent):
             # Pylance + NP error for unreachanble code -- see https://github.com/numpy/numpy/issues/22146
             # Works ok for numpy 1.23.4+
             norm = np.cross(vert_0 - b_center_3d, vert_1 - b_center_3d)
-            norm /= np.linalg.norm(norm)
-            norms.append(norm)
+            n_len = np.linalg.norm(norm)
+            if n_len < 1e-9:
+                # Degenerate pair: the two bounding-box vertices coincide, or they
+                # are collinear with the centre, so the cross product vanishes.
+                # Dividing here produced NaN, which then poisoned avg_norm and made
+                # autonorm()'s `dot(norm, translation) < 0` test evaluate False --
+                # silently skipping the right/wrong-side fix, so a mirrored panel kept
+                # its flipped winding and its triangles faced inward. Symptom: pant
+                # legs inside-out in the boxmesh, seams stitching a front face to a
+                # back face, and the sim thrashing to the frame cap. Seen on barrel
+                # legs, where the single-arc outseam can put a curve extremum exactly
+                # on another bbox-touching vertex. Skip the pair instead.
+                continue
+            norms.append(norm / n_len)
+        if not norms:
+            raise ValueError(
+                f'{self.name}::ERROR::panel normal is undefined: every bounding-box '
+                'vertex pair is degenerate')
 
         # Current norm direction
         avg_norm = sum(norms) / len(norms)

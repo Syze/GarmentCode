@@ -163,10 +163,35 @@ def create_UV_island_texture(
     fig, ax = plt.subplots()
     fig.set_size_inches(width / 100, height / 100)  # width & height are usually given in cm
 
-    # Colors — distinct per panel
+    # Colors -- distinct per panel.
+    # Set2 only holds 8, so any garment with more panels wrapped and gave two
+    # panels the same colour (a 10-panel dress had both skirt pairs collide),
+    # which makes a render useless for telling panels apart. Pick a qualitative
+    # map big enough for the panel count, and fall back to evenly spaced hues.
     divisor = max(5, n_components)
-    cmap = matplotlib.colormaps['Set2']   # Distinct, vivid per-panel colors
-    color_sample = [cmap(id % cmap.N / cmap.N) if hasattr(cmap, 'N') else cmap(id / divisor) for id in range(divisor)]
+    # Set2 holds only 8 entries and was indexed as id % 8, so a garment with more
+    # panels silently gave two of them the same colour (a 10-panel dress had both
+    # skirt pairs collide), making a render useless for telling panels apart.
+    #
+    # Keep Set2 for the first 8 so existing renders are unchanged, then extend by
+    # greedily taking whichever candidate is furthest in RGB from everything
+    # already chosen. Simply appending Set3 is not enough: its first entries are
+    # pale versions of Set2's, so panel 0 and panel 8 still looked identical.
+    palette = [matplotlib.colormaps['Set2'](i / 8) for i in range(8)]
+    if divisor > len(palette):
+        pool = [matplotlib.colormaps[name](i / n)
+                for name, n in (('Set1', 9), ('Set3', 12), ('tab20', 20))
+                for i in range(n)]
+        while len(palette) < divisor and pool:
+            chosen = np.array([c[:3] for c in palette])
+            best = max(pool, key=lambda c: np.min(
+                np.linalg.norm(chosen - np.array(c[:3]), axis=1)))
+            palette.append(best)
+            pool.remove(best)
+        while len(palette) < divisor:            # exhausted the pool
+            hsv = matplotlib.colormaps['hsv']
+            palette.append(hsv(len(palette) / divisor))
+    color_sample = [palette[id % len(palette)] for id in range(divisor)]
 
     # Background -- garment style
     if background_img_path is not None:

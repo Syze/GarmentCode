@@ -188,8 +188,18 @@ class Panel:
             # Pylance + NP error for unreachanble code -- see https://github.com/numpy/numpy/issues/22146
             # Works ok for numpy 1.23.4+
             norm = np.cross(vert_0-center_3d, vert_1-center_3d)
-            norm /= np.linalg.norm(norm)
-            norms.append(norm)
+            mag = np.linalg.norm(norm)
+            # Skip degenerate terms instead of dividing by zero: whenever the
+            # panel centre happens to lie on the line through two consecutive
+            # reference verts the cross product vanishes, and the resulting NaN
+            # poisons the average so the whole panel is rejected even though its
+            # normal is perfectly well defined by every other term.
+            if mag < 1e-12:
+                continue
+            norms.append(norm / mag)
+        if not norms:
+            raise NormError(f"{self.__class__.__name__}::ERROR::no valid panel norm "
+                            f"for {self.panel_name}")
 
         # Current norm direction
         avg_norm = sum(norms) / len(norms)
@@ -219,6 +229,12 @@ class Panel:
             * r_t_vertex (numpy array): Coordinates of the rotated and translated 3D vertex
         """
 
+        # NOTE (2026-08-06): euler_xyz_to_R builds Rz.Ry.Rx (scipy EXTRINSIC
+        # 'xyz'), while spec['rotation'] is written by Panel.assembly() as scipy
+        # INTRINSIC 'XYZ' (Rx.Ry.Rz). Equal only for single-axis rotations, which
+        # is every panel in this repo -- a true 3-axis panel rotation is meshed
+        # in the wrong orientation. See the notes in pattern/rotation.py and
+        # garmentcode/panel.py::assembly.
         rot_matrix = rotation_tools.euler_xyz_to_R(self.rotation)
         r_t_vertex = BoxMesh._point_in_3D(vertex, rot_matrix, self.translation)
         return r_t_vertex
@@ -236,6 +252,8 @@ class Panel:
         """
         if len(vertices) == 0:
             return []
+        # Same convention caveat as _point_in_3D above: euler_xyz_to_R is
+        # Rz.Ry.Rx, the spec's angles are scipy intrinsic 'XYZ' (Rx.Ry.Rz).
         rot_matrix = rotation_tools.euler_xyz_to_R(self.rotation)
         r_t_vertices = np.vstack(tuple([BoxMesh._point_in_3D(v, rot_matrix, self.translation) for v in np.array(vertices)]))
         return r_t_vertices

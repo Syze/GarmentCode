@@ -795,7 +795,19 @@ def annotate_pattern_svg(svg_path, spec_path, measurements, offset_dist=4.0, fon
         cairosvg.svg2png(url=str(svg_path), write_to=str(png_path), dpi=2.54 * 3)
 
 
-def _fit_rise_parameters(prod, body_yaml_path, base_garment_measurements):
+def _merge_design(base, overrides):
+    """Recursively merge `overrides` into `base` (same semantics as
+    run_garment._deep_merge). Kept here so the rise fit can apply the config's
+    design_overrides to its trial patterns."""
+    for k, v in (overrides or {}).items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            _merge_design(base[k], v)
+        else:
+            base[k] = v
+
+
+def _fit_rise_parameters(prod, body_yaml_path, base_garment_measurements,
+                         design_overrides=None):
     """Numerically fit (rise_v, front_crotch_fraction) to match production F/B rise seam arcs.
 
     Joint 2D least-squares (trust-region-reflective) on the residual vector
@@ -804,7 +816,15 @@ def _fit_rise_parameters(prod, body_yaml_path, base_garment_measurements):
     other parameter (e.g. wide-leg flared jeans where the F-rise target is
     only achievable at an interior rise_v ≠ either bisection endpoint).
 
-    Returns: (rise_v, front_crotch_fraction)
+    `design_overrides` is the config's design_overrides['pants'] subtree. It MUST be
+    applied to every trial pattern: an override that reshapes the leg -- `barrel_bow`
+    above all -- changes the center-front/back seam arc lengths, which are exactly the
+    residuals being fitted here. Fitting without it and injecting it afterwards leaves
+    the rise solved for a different leg. On 1281851 (widest thigh AND knee in the set,
+    knee/thigh 1.001) that mismatch put both rises ~8cm over target; on milder legs like
+    1309848 it is small enough to hide.
+
+    Returns: (rise_v, front_crotch_fraction, back_rise_lift)
     """
     from assets.garment_programs.meta_garment import MetaGarment
     from assets.bodies.body_params import BodyParameters
@@ -832,6 +852,8 @@ def _fit_rise_parameters(prod, body_yaml_path, base_garment_measurements):
         design = mapper.map_pants(gm)
         design['pants']['front_crotch_fraction'] = {'v': float(front_fraction)}
         design['pants']['back_rise_lift'] = {'v': float(back_lift)}
+        if design_overrides:
+            _merge_design(design.setdefault('pants', {}), design_overrides)
         try:
             garment = MetaGarment('_fit', body_params, design)
             pattern = garment.assembly()
@@ -907,7 +929,8 @@ def _fit_rise_parameters(prod, body_yaml_path, base_garment_measurements):
 def map_production_to_design(prod, body_yaml_path, elastic_waistband=False,
                              balloon_leg=False, cuff_inseam_fraction=None,
                              cuff_ease=1.0, elastic_waist_gather=False,
-                             waist_match_body=False, front_slit=None):
+                             waist_match_body=False, front_slit=None,
+                             design_overrides=None):
     """Map production measurements to GarmentCode design parameters.
 
     Args:
@@ -970,7 +993,11 @@ def map_production_to_design(prod, body_yaml_path, elastic_waistband=False,
     if 'Front Rise' in prod and 'Back Rise' in prod:
         # Fit rise_v, front_crotch_fraction, and back_rise_lift to match production
         # seam arc targets (3 DOF: total rise, F/B crotch split, back-rise scoop)
-        rise_v, front_fraction, back_lift = _fit_rise_parameters(prod, body_yaml_path, garment_measurements)
+        # Pass the pants design_overrides into the fit so its trial patterns match the
+        # leg we will actually build (see _fit_rise_parameters).
+        rise_v, front_fraction, back_lift = _fit_rise_parameters(
+            prod, body_yaml_path, garment_measurements,
+            design_overrides=(design_overrides or {}).get('pants'))
         garment_measurements['rise'] = rise_v
         design = mapper.map_pants(garment_measurements)
         design['pants']['front_crotch_fraction'] = {'v': float(front_fraction)}
@@ -1019,6 +1046,12 @@ def map_production_to_design(prod, body_yaml_path, elastic_waistband=False,
     # front panel ankle edge at center-front. Read by PantPanel via PantsHalf.
     if front_slit:
         design['pants']['front_slit'] = {'v': float(front_slit)}
+
+    # Bake the overrides in here as well, so the design returned already matches what
+    # the rise fit solved against. run_garment merges them again afterwards, which is
+    # then idempotent.
+    if design_overrides:
+        _merge_design(design, design_overrides)
 
     return design
 
@@ -1274,7 +1307,8 @@ def _body_crotch_Y(body, body_yaml_path):
 def generate_pattern(size, design, body_yaml_path, output_base, name_prefix='',
                      garment_prefix='hm_pants',
                      ankle_clearance_pct=0.0,
-                     anchor_mode='crotch_zero'):
+                     anchor_mode='crotch_zero',
+                     extra_x_sep=0.0):
     """Generate pattern using built-in MetaGarment system.
 
     Placement: 'crotch_zero' is the ONLY supported anchor mode. The whole
@@ -1350,13 +1384,20 @@ def generate_pattern(size, design, body_yaml_path, output_base, name_prefix='',
     # hook is deep enough that the two legs' fly edges overlap ~11cm at init.
     # `clo_dxf.x_sep` (a profile-supplied half-distance) clears it; absent/zero
     # for every other config, so this is a no-op for the whole HM_Jeans batch.
-    _xsep = 0.0
+    #
+    # Any config may also request it directly via the `extra_x_sep` key (target
+    # clearance gap in cm between the legs at init). A non-zero DXF profile
+    # x_sep still wins, so the PantsCLO path is unchanged; configs that set
+    # neither keep _xsep=0.0 and the feature stays off exactly as before.
+    _xsep = float(extra_x_sep or 0.0)
     _clo = design.get('clo_dxf')
     if isinstance(_clo, dict):
         _dxf_path = _clo.get('path', {}).get('v') if isinstance(_clo.get('path'), dict) else _clo.get('path')
         if _dxf_path:
             from assets.garment_programs.pants_clo import _profile
-            _xsep = float(_profile(_dxf_path).get('x_sep', 0.0) or 0.0)
+            _profile_xsep = float(_profile(_dxf_path).get('x_sep', 0.0) or 0.0)
+            if _profile_xsep:
+                _xsep = _profile_xsep
     _brl = (design['pants']['back_rise_lift']['v']
             if isinstance(design.get('pants', {}).get('back_rise_lift'), dict)
             and design['pants']['back_rise_lift'].get('v') is not None

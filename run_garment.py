@@ -36,17 +36,24 @@ def load_garment_config(config_path):
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
     # Ensure production_data keys are integers
+    # DXF-driven garments are sized by letter ('M'), so only coerce numerals.
+    def _size(v):
+        return int(v) if str(v).lstrip('-').isdigit() else v
     if 'production_data' in cfg:
-        cfg['production_data'] = {int(k): v for k, v in cfg['production_data'].items()}
+        cfg['production_data'] = {_size(k): v for k, v in cfg['production_data'].items()}
     if 'sizes' in cfg:
-        cfg['sizes']['all'] = [int(s) for s in cfg['sizes'].get('all', [])]
-        cfg['sizes']['run'] = [int(s) for s in cfg['sizes'].get('run', [])]
+        cfg['sizes']['all'] = [_size(s) for s in cfg['sizes'].get('all', [])]
+        cfg['sizes']['run'] = [_size(s) for s in cfg['sizes'].get('run', [])]
     return cfg
 
 
 def run_pipeline(config):
     """Run the full garment pipeline from a loaded config dict."""
     garment_type = config.get('garment_type', 'pants')
+    # `pattern_source` is orthogonal to garment_type: a DXF-driven garment is
+    # still a pants/shirt/skirt, it just skips the production->design mapping
+    # because its panels come straight out of the AAMA file.
+    dxf_pattern = config.get('pattern_source') == 'dxf'
 
     # Import shared utilities from pants module (simulate, mesh, normalize)
     from run_custom_pants import (
@@ -56,7 +63,10 @@ def run_pipeline(config):
     )
 
     # Import garment-type-specific functions
-    if garment_type == 'shirt':
+    if dxf_pattern:
+        from assets.garment_programs.hyperdrop import generate_pattern
+        map_production_to_design = None
+    elif garment_type == 'shirt':
         from run_custom_tshirt import (
             map_production_to_design,
             generate_pattern,
@@ -74,7 +84,7 @@ def run_pipeline(config):
         )
 
     # SYMKNEE flag for pants knee placement (pants path only)
-    if garment_type not in ('shirt', 'skirt'):
+    if not dxf_pattern and garment_type not in ('shirt', 'skirt'):
         from assets.garment_programs import pants as _pants_mod
         _pants_mod.SYMKNEE = bool(config.get('symknee', False))
 
@@ -95,7 +105,8 @@ def run_pipeline(config):
 
     print("=" * 60)
     print(f"  Garment Pipeline: {config.get('name', garment_prefix)}")
-    print(f"  Type: {garment_type}")
+    print(f"  Type: {garment_type}"
+          + (f" (pattern from DXF: {config['hyperdrop']['style']})" if dxf_pattern else ""))
     print(f"  Body: {body_name}")
     print(f"  Sizes: {sizes_to_run}")
     print(f"  GPU: CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'not set')}")
@@ -105,9 +116,17 @@ def run_pipeline(config):
     print("\n--- Step 1: Generating patterns ---")
     generated = []
     for size in sizes_to_run:
-        prod = production_data[size]
+        prod = production_data.get(size, {})
         summary = ', '.join(f'{k}={v}' for k, v in prod.items())
         print(f'\nSize {size}: {summary}')
+
+        if dxf_pattern:
+            folder, garment_name = generate_pattern(
+                size, config, body_yaml, output_base,
+                garment_prefix=garment_prefix,
+                labels=config.get('labels', False))
+            generated.append((folder, garment_name, size))
+            continue
 
         if garment_type == 'shirt':
             design = map_production_to_design(prod, body_yaml)
@@ -126,6 +145,9 @@ def run_pipeline(config):
                 elastic_waist_gather=config.get('elastic_waist_gather', False),
                 waist_match_body=config.get('waist_match_body', False),
                 front_slit=config.get('front_slit'),
+                # Given to the rise fit so its trial patterns carry the same leg
+                # geometry (barrel_bow etc.) as the pattern we finally build.
+                design_overrides=config.get('design_overrides'),
             )
         # Apply design overrides from config (e.g. upper type, collar, placket)
         if 'design_overrides' in config:
@@ -146,6 +168,7 @@ def run_pipeline(config):
                 garment_prefix=garment_prefix,
                 ankle_clearance_pct=config.get('ankle_clearance_pct', 0.0),
                 anchor_mode=config.get('anchor_mode', 'crotch_zero'),
+                extra_x_sep=config.get('extra_x_sep', 0.0),
             )
         # Post-process collar panels: rotate into fold positions.
         # Panels are serialized flat to avoid stitching vertex collapse;
@@ -159,7 +182,11 @@ def run_pipeline(config):
         generated.append((folder, garment_name, size))
 
     # Step 2: Verify measurements (pants only)
-    if garment_type != 'shirt':
+    if dxf_pattern or garment_type == 'shirt':
+        reason = 'pattern is taken from the DXF' if dxf_pattern \
+            else f'not implemented for {garment_type}'
+        print(f'\n--- Step 2: Skipping measurement verification ({reason}) ---')
+    else:
         print("\n--- Step 2: Verifying pattern measurements ---")
         for folder, name, size in generated:
             spec_files = list(folder.glob('*_specification.json'))
@@ -169,8 +196,6 @@ def run_pipeline(config):
                                     elastic_waistband=config.get('elastic_waistband', False))
             else:
                 print(f'  No spec file found for size {size}')
-    else:
-        print("\n--- Step 2: Skipping measurement verification (not implemented for shirts) ---")
 
     # Step 3: Simulate
     if config.get('generate_only'):
@@ -268,7 +293,10 @@ if __name__ == '__main__':
 
     config = load_garment_config(args.config)
     if args.sizes:
-        config['sizes']['run'] = [int(s) for s in args.sizes.split(',')]
+        # letter sizes ('S,M,L') for DXF-driven garments, numerals for the rest
+        config['sizes']['run'] = [
+            int(s) if s.strip().lstrip('-').isdigit() else s.strip()
+            for s in args.sizes.split(',')]
     if args.body_yaml or args.body_name:
         config['_body_overridden'] = True
     if args.body_yaml:
