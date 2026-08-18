@@ -75,11 +75,14 @@ class SimulateRequest(BaseModel):
     normalize_body: bool = True
     # SMPL body auto-generation (used only when body_name does not already
     # exist under assets/bodies): shape coefficients (exactly 10 floats;
-    # default = mean body) and gender (selects the SMPL model and the
-    # custom pose). Generation produces {body_name}_apose.obj and
-    # {body_name}_custompose.obj; the custom pose is the one simulated on.
+    # default = mean body), gender (selects the SMPL model and the custom
+    # pose), and optional target height — the generated mesh is uniformly
+    # scaled so its A-pose Y bounding box equals height (metres; values > 3
+    # are treated as centimetres). Generation produces {body_name}_apose.obj
+    # and {body_name}_custompose.obj; the custom pose is the one simulated on.
     betas: Optional[List[float]] = None
     gender: str = 'female'
+    height: Optional[float] = None
     # Bypass request deduplication: identical requests normally coalesce onto
     # the in-flight job (or reuse the succeeded one); force=True always re-runs.
     force: bool = False
@@ -233,6 +236,15 @@ def _validate_request(req: SimulateRequest) -> dict:
     if gender not in ('female', 'male'):
         raise HTTPException(422, "gender must be 'female' or 'male'")
 
+    height = req.height
+    if height is not None:
+        if height > 3.0:  # centimetres
+            height = height / 100.0
+        if not 1.0 <= height <= 2.5:
+            raise HTTPException(
+                422, f'height must be a plausible body height in metres or '
+                     f'centimetres (got {req.height})')
+
     def _cfg_path(key):
         p = Path(SERVER_CONFIG[key])
         return p if p.is_absolute() else (REPO_ROOT / p).resolve()
@@ -312,6 +324,7 @@ def _validate_request(req: SimulateRequest) -> dict:
         'smpl_model': str(smpl_model),
         'pose_file': str(pose_file),
         'betas': betas,
+        'height': height,
     }
 
 
@@ -338,6 +351,7 @@ def _dedup_key(payload: dict) -> str:
         'garment_name': payload['garment_name'],
         'normalize_body': payload['normalize_body'],
         'betas': payload.get('betas'),
+        'height': payload.get('height'),
         'sim_props': (file_stamp(payload['sim_props'])
                       if isinstance(payload['sim_props'], str)
                       else payload['sim_props']),
@@ -366,7 +380,8 @@ def _collect_fails(sim_folder: Path) -> list:
         return []
 
 
-def _generate_smpl_body(base_path: Path, model_pkl: str, pose_file: str, betas=None):
+def _generate_smpl_body(base_path: Path, model_pkl: str, pose_file: str,
+                        betas=None, height=None):
     """Generate an SMPL body pair: {base}_apose.obj and {base}_custompose.obj.
 
     Uses the repo's numpy SMPL implementation (smpl_pose.py), the A-pose
@@ -374,6 +389,8 @@ def _generate_smpl_body(base_path: Path, model_pkl: str, pose_file: str, betas=N
     custom pose (72 axis-angle values) from pose_file. Both meshes are in
     metres and share the A-pose Y-shift (feet at Y=0 in A-pose), matching
     the existing assets/bodies meshes and the pose-animation convention.
+    When height (metres) is given, both meshes are uniformly scaled by the
+    same factor so the A-pose Y bounding box equals height.
     """
     import numpy as np
     import trimesh
@@ -386,13 +403,19 @@ def _generate_smpl_body(base_path: Path, model_pkl: str, pose_file: str, betas=N
 
     verts_a = smpl_forward(model, betas, THETA_A)
     yshift = verts_a[:, 1].min()
+    scale = 1.0
+    if height:
+        scale = float(height) / float(verts_a[:, 1].max() - yshift)
+        print(f'  SMPL height scaling: {verts_a[:, 1].max() - yshift:.3f}m '
+              f'-> {height:.3f}m (x{scale:.4f})')
     base_path.parent.mkdir(parents=True, exist_ok=True)
     for verts, path in (
             (verts_a, base_path.with_name(f'{base_path.name}_apose.obj')),
             (smpl_forward(model, betas, theta_custom),
              base_path.with_name(f'{base_path.name}_custompose.obj'))):
-        verts = verts.copy()
-        verts[:, 1] -= yshift
+        # Shift first (A-pose feet to Y=0), then scale about the origin so
+        # the feet stay grounded and both poses scale consistently.
+        verts = (verts - [0.0, yshift, 0.0]) * scale
         trimesh.Trimesh(verts, model['f'], process=False).export(str(path))
         print(f'  Generated SMPL body: {path}')
 
@@ -415,7 +438,8 @@ def _sim_worker_entry(payload: dict):
         if payload.get('generate_body') and not body_obj.is_file():
             _generate_smpl_body(Path(f"./assets/bodies/{payload['generate_base']}"),
                                 payload['smpl_model'], payload['pose_file'],
-                                betas=payload.get('betas'))
+                                betas=payload.get('betas'),
+                                height=payload.get('height'))
 
         from run_custom_pants import normalize_body_mesh, simulate_pattern
 
