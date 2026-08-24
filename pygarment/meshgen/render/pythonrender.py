@@ -290,9 +290,41 @@ class FrameRenderer:
 
 def render_images(paths: PathCofig, body_v, body_f, render_props):
 
+    sides = render_props['sides']
+    if len(sides) > 1 and render_props.get('parallel_renders', False):
+        # Opt-in (render.config.parallel_renders). Measured a wash on 2 sides:
+        # the duplicated mesh load costs about what the overlap saves, so the
+        # default stays serial. Worth enabling only for more than two sides.
+        # One thread per side. Each builds its OWN meshes: a pyrender Primitive
+        # caches its VAO/VBO ids on the object, so two renderers touching the
+        # same mesh concurrently would corrupt that state. Duplicating the
+        # mesh load is the price of running the GL work in parallel.
+        import threading
+
+        errors = []
+
+        def _one(side):
+            try:
+                gm, bm = load_meshes(paths, body_v, body_f)
+                render(gm, bm, side, paths, render_props)
+            except BaseException as e:
+                errors.append((side, e))
+
+        threads = [threading.Thread(target=_one, args=(s,), name=f'render-{s}')
+                   for s in sides]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        if not errors:
+            return
+        # Any failure: redo everything serially, which is the known-good path.
+        print(f'Parallel render failed {[(s, str(e)) for s, e in errors]}; '
+              f'falling back to serial')
+
     pyrender_garm_mesh, pyrender_body_mesh = load_meshes(paths, body_v, body_f)
 
-    for side in render_props['sides']:
+    for side in sides:
         render(pyrender_garm_mesh, pyrender_body_mesh, side, paths, render_props)
 
 
