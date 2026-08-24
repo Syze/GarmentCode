@@ -48,6 +48,155 @@ class NormError(BaseException):
     pass
 # !SECTION
 # SECTION Mesh objects
+
+# ---- Panel meshing worker pool -------------------------------------------
+# Panels mesh independently, but the CGAL bindings hold the GIL, so real
+# parallelism needs processes. The pool is opt-in via init_panel_pool():
+# fork() from a process that already has a live CUDA/Warp context is a known
+# hazard, so callers initialise it BEFORE Warp comes up (the service does this
+# in its pre-warmed worker). Without initialisation the meshing stays serial.
+_PANEL_POOL = None
+
+
+def init_panel_pool(workers=4):
+    """Start the panel-meshing process pool. Call before Warp/CUDA init."""
+    global _PANEL_POOL
+    if _PANEL_POOL is not None or workers is None or int(workers) < 2:
+        return _PANEL_POOL
+    try:
+        import multiprocessing
+        from concurrent.futures import ProcessPoolExecutor
+        _PANEL_POOL = ProcessPoolExecutor(
+            max_workers=int(workers),
+            mp_context=multiprocessing.get_context('fork'))
+        # ProcessPoolExecutor forks lazily on first submit, which would land
+        # mid-job -- after Warp/CUDA is up, exactly what this ordering exists
+        # to avoid. Force the children to exist now.
+        list(_PANEL_POOL.map(int, range(int(workers))))
+    except Exception as e:
+        print(f'BoxMesh::panel pool unavailable, meshing serially ({e})')
+        _PANEL_POOL = None
+    return _PANEL_POOL
+
+
+def shutdown_panel_pool():
+    """Stop the pool and make sure its children are actually gone.
+
+    The children are non-daemonic, so anything left alive blocks interpreter
+    exit in the parent (multiprocessing joins them in its atexit hook) -- which
+    hangs the caller forever. shutdown() alone does not guarantee that, so reap
+    explicitly.
+    """
+    global _PANEL_POOL
+    pool, _PANEL_POOL = _PANEL_POOL, None
+    if pool is None:
+        return
+    procs = list(getattr(pool, '_processes', {}).values())
+    try:
+        pool.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        pass
+    for proc in procs:
+        try:
+            if proc.is_alive():
+                proc.terminate()
+            proc.join(2)
+            if proc.is_alive():
+                proc.kill()
+                proc.join(2)
+        except Exception:
+            pass
+
+
+def mesh_panel_cdt(points, edge_verts_ids, mesh_resolution, panel_name,
+                   plot=False, check=False):
+    """CGAL constrained-Delaunay meshing for a single panel.
+
+    Split out of Panel.gen_panel_mesh so it can run in a worker process:
+    panels are independent, but the CGAL bindings hold the GIL (measured:
+    4 threads ran at 0.83x of serial), so threads cannot parallelise this.
+    Takes and returns only plain point/index data, which keeps the pickle
+    cost per panel small.
+    """
+    len_points = len(points)
+
+
+    cdt_mesh = tri_utils.Mesh_2_Constrained_Delaunay_triangulation_2()
+    cdt_points_mesh = tri_utils.create_cdt_points(cdt_mesh,points)
+    tri_utils.cdt_insert_constraints(cdt_mesh,cdt_points_mesh,edge_verts_ids)
+
+    #Meshing the triangulation with default shape criterion; i.e. sqrt(1/(4 * 0.125)) = sqrt(2)
+    tri_utils.CGAL_Mesh_2.refine_Delaunay_mesh_2(cdt_mesh,
+                                       tri_utils.Delaunay_mesh_size_criteria_2(0.125, 1.43 * mesh_resolution)) #1.475
+
+    if plot:
+        # Mark faces that are inside the domain
+        face_info = tri_utils.mark_domain(cdt_mesh)
+        tri_utils.plot_triangulation(cdt_mesh, face_info)
+
+    keep_pts_f = tri_utils.get_keep_vertices(cdt_mesh, len_points)
+
+    # Triangulate mesh without newly inserted boundary points
+    cdt = tri_utils.Constrained_Delaunay_triangulation_2()
+    cdt_points = tri_utils.create_cdt_points(cdt, keep_pts_f)
+    new_points = tri_utils.cdt_insert_constraints(cdt, cdt_points, edge_verts_ids)
+
+    # Faces without accidentially inserted points -- again!
+    # NOTE: point insertion might be a sign of degenerate triangles.
+    # But instead a separate check was added
+    f = list(tri_utils.get_face_v_ids(cdt, keep_pts_f, new_points, check=check, plot=plot))
+
+    # Drop tiny disconnected fragments from the CDT result.
+    # When cut_corner produces a near-degenerate corner_shape (start and
+    # end of the curve nearly coincident, which happens for wide collars/
+    # armholes on small panels), CGAL CDT can split the panel into a main
+    # region + a tiny fragment touching at a single vertex. Those
+    # fragments become separate UV islands (igl.facet_components needs a
+    # shared edge, not just a shared vertex) and show up as cosmetic
+    # mini-panels in the rendered texture. Keep the largest component.
+    if len(f) > 0:
+        import igl as _igl
+        f_arr = np.asarray(f)
+        num_comps, face_comp = _igl.facet_components(f_arr)
+        if num_comps > 1:
+            comp_sizes = np.bincount(face_comp)
+            main_comp = int(np.argmax(comp_sizes))
+            kept_mask = face_comp == main_comp
+            dropped = int((~kept_mask).sum())
+            if dropped > 0:
+                print(f'Panel::{panel_name}::'
+                      f'dropped {dropped} disconnected faces from CDT '
+                      f'(kept main component with {comp_sizes[main_comp]} faces)')
+            # Preserve original element type (numpy arrays) — downstream
+            # does `face + texture_offset` which requires array-like.
+            f = list(f_arr[kept_mask])
+
+    # Drop degenerate sliver triangles (near-collinear vertices that fail
+    # the triangle inequality used by is_manifold). They arise from CDT on
+    # thin/concave regions — e.g. the shoulder strap left between a wide
+    # off-shoulder collar and the armhole. A sliver has ~zero area and lies
+    # on a line that adjacent triangles already cover, so removing it
+    # leaves no real hole but prevents NaN face normals + the manifold
+    # check from aborting the whole garment.
+    if len(f) > 0:
+        pts = np.asarray(keep_pts_f)
+        f_arr = np.asarray(f)
+        tri = pts[f_arr]
+        s = np.stack([
+            np.linalg.norm(tri[:, 0] - tri[:, 1], axis=1),
+            np.linalg.norm(tri[:, 1] - tri[:, 2], axis=1),
+            np.linalg.norm(tri[:, 0] - tri[:, 2], axis=1),
+        ], axis=-1)
+        good = s.sum(axis=1) > 2 * s.max(axis=1) + 1e-2
+        n_bad = int((~good).sum())
+        if n_bad > 0:
+            print(f'Panel::{panel_name}::'
+                  f'dropped {n_bad} degenerate sliver triangle(s) from CDT')
+            f = list(f_arr[good])
+
+
+    return keep_pts_f, f
+
 class Panel:
     """
     Represents a panel of the pattern:
@@ -336,7 +485,7 @@ class Panel:
         return n_stitch_edges, sorted_edges
 
 
-    def gen_panel_mesh(self, mesh_resolution, plot=False, check=False): 
+    def gen_panel_mesh(self, mesh_resolution, plot=False, check=False):
         """
         This function generates the vertices inside the panel using the vertices along the edges.
         Input:
@@ -347,83 +496,9 @@ class Panel:
             * keep_pts_f (list): Vertices inside the panel (without newly inserted boundary vertices)
             * f (list): Triangle faces of the panel
         """
-        points = self.panel_vertices
-        len_points = len(points)
-        edge_verts_ids = tri_utils.get_edge_vert_ids(self.edges)
-
-
-        cdt_mesh = tri_utils.Mesh_2_Constrained_Delaunay_triangulation_2()
-        cdt_points_mesh = tri_utils.create_cdt_points(cdt_mesh,points)
-        tri_utils.cdt_insert_constraints(cdt_mesh,cdt_points_mesh,edge_verts_ids)
-
-        #Meshing the triangulation with default shape criterion; i.e. sqrt(1/(4 * 0.125)) = sqrt(2)
-        tri_utils.CGAL_Mesh_2.refine_Delaunay_mesh_2(cdt_mesh,
-                                           tri_utils.Delaunay_mesh_size_criteria_2(0.125, 1.43 * mesh_resolution)) #1.475
-
-        if plot:
-            # Mark faces that are inside the domain
-            face_info = tri_utils.mark_domain(cdt_mesh)
-            tri_utils.plot_triangulation(cdt_mesh, face_info)
-
-        keep_pts_f = tri_utils.get_keep_vertices(cdt_mesh, len_points)
-
-        # Triangulate mesh without newly inserted boundary points
-        cdt = tri_utils.Constrained_Delaunay_triangulation_2()
-        cdt_points = tri_utils.create_cdt_points(cdt, keep_pts_f)
-        new_points = tri_utils.cdt_insert_constraints(cdt, cdt_points, edge_verts_ids)
-
-        # Faces without accidentially inserted points -- again!
-        # NOTE: point insertion might be a sign of degenerate triangles.
-        # But instead a separate check was added
-        f = list(tri_utils.get_face_v_ids(cdt, keep_pts_f, new_points, check=check, plot=plot))
-
-        # Drop tiny disconnected fragments from the CDT result.
-        # When cut_corner produces a near-degenerate corner_shape (start and
-        # end of the curve nearly coincident, which happens for wide collars/
-        # armholes on small panels), CGAL CDT can split the panel into a main
-        # region + a tiny fragment touching at a single vertex. Those
-        # fragments become separate UV islands (igl.facet_components needs a
-        # shared edge, not just a shared vertex) and show up as cosmetic
-        # mini-panels in the rendered texture. Keep the largest component.
-        if len(f) > 0:
-            import igl as _igl
-            f_arr = np.asarray(f)
-            num_comps, face_comp = _igl.facet_components(f_arr)
-            if num_comps > 1:
-                comp_sizes = np.bincount(face_comp)
-                main_comp = int(np.argmax(comp_sizes))
-                kept_mask = face_comp == main_comp
-                dropped = int((~kept_mask).sum())
-                if dropped > 0:
-                    print(f'{self.__class__.__name__}::{self.panel_name}::'
-                          f'dropped {dropped} disconnected faces from CDT '
-                          f'(kept main component with {comp_sizes[main_comp]} faces)')
-                # Preserve original element type (numpy arrays) — downstream
-                # does `face + texture_offset` which requires array-like.
-                f = list(f_arr[kept_mask])
-
-        # Drop degenerate sliver triangles (near-collinear vertices that fail
-        # the triangle inequality used by is_manifold). They arise from CDT on
-        # thin/concave regions — e.g. the shoulder strap left between a wide
-        # off-shoulder collar and the armhole. A sliver has ~zero area and lies
-        # on a line that adjacent triangles already cover, so removing it
-        # leaves no real hole but prevents NaN face normals + the manifold
-        # check from aborting the whole garment.
-        if len(f) > 0:
-            pts = np.asarray(keep_pts_f)
-            f_arr = np.asarray(f)
-            tri = pts[f_arr]
-            s = np.stack([
-                np.linalg.norm(tri[:, 0] - tri[:, 1], axis=1),
-                np.linalg.norm(tri[:, 1] - tri[:, 2], axis=1),
-                np.linalg.norm(tri[:, 0] - tri[:, 2], axis=1),
-            ], axis=-1)
-            good = s.sum(axis=1) > 2 * s.max(axis=1) + 1e-2
-            n_bad = int((~good).sum())
-            if n_bad > 0:
-                print(f'{self.__class__.__name__}::{self.panel_name}::'
-                      f'dropped {n_bad} degenerate sliver triangle(s) from CDT')
-                f = list(f_arr[good])
+        keep_pts_f, f = mesh_panel_cdt(
+            self.panel_vertices, tri_utils.get_edge_vert_ids(self.edges),
+            mesh_resolution, self.panel_name, plot=plot, check=check)
 
         #Store
         self.panel_vertices = keep_pts_f
@@ -826,6 +901,8 @@ class BoxMesh(wrappers.VisPattern):
         Input:
         * self (BoxMesh object): Instance of BoxMesh class from which the function is called
         """
+        # Phase 1 (serial, cheap): edge vertices + panel norms. This mutates
+        # panel state and is microseconds per panel.
         for panelname in self.panelNames:
             panel = self.panels[panelname]
 
@@ -844,8 +921,36 @@ class BoxMesh(wrappers.VisPattern):
 
             #Set panel norm
             panel.set_panel_norm()
-            #Generate panel mesh and store them in panel.panel_vertices and panel.panel_faces
-            panel.gen_panel_mesh(self.mesh_resolution)
+
+        # Phase 2: CDT meshing -- the expensive part, and independent per
+        # panel. Farmed out to the worker pool when one has been initialised.
+        results = {}
+        if _PANEL_POOL is not None:
+            try:
+                futures = {}
+                for panelname in self.panelNames:
+                    panel = self.panels[panelname]
+                    futures[panelname] = _PANEL_POOL.submit(
+                        mesh_panel_cdt, panel.panel_vertices,
+                        tri_utils.get_edge_vert_ids(panel.edges),
+                        self.mesh_resolution, panel.panel_name)
+                for panelname, fut in futures.items():
+                    results[panelname] = fut.result()
+            except Exception as e:
+                # A pool failure must not lose the garment: fall back to
+                # meshing in-process. Panel state from phase 1 is untouched.
+                print(f'{self.__class__.__name__}::panel pool failed, '
+                      f'meshing serially ({type(e).__name__}: {e})')
+                results = {}
+
+        # Phase 3 (serial): store results and run the manifold checks.
+        for panelname in self.panelNames:
+            panel = self.panels[panelname]
+            if panelname in results:
+                panel.panel_vertices, panel.panel_faces = results[panelname]
+            else:
+                #Generate panel mesh and store them in panel.panel_vertices and panel.panel_faces
+                panel.gen_panel_mesh(self.mesh_resolution)
 
             # Sanity check 
             if not panel.is_manifold():
