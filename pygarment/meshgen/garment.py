@@ -103,10 +103,30 @@ class Cloth:
             self.create_graph()
 
         self.last_verts = None
+        self._last_motion = None
+        self._frames_since_collide = 0
         self._verts_np = None
         self._verts_frame = -1
         self._last_verts_frame = None
         self.current_verts = wp.array.numpy(self.state_0.particle_q)
+
+    def _adaptive_interval(self, max_interval):
+        """Collide interval for this frame, from the cloth's own motion.
+
+        Scaled by static_threshold, which is already the "is it still moving"
+        yardstick for this sim, so the policy travels with the config.
+        """
+        m = getattr(self, '_last_motion', None)
+        if m is None:
+            return 1
+        st = max(float(self.config.static_threshold), 1e-9)
+        if m > 8.0 * st:
+            return 1
+        if m > 4.0 * st:
+            return 2
+        if m > 2.0 * st:
+            return max(2, max_interval // 2)
+        return max_interval
 
     @property
     def current_verts(self):
@@ -761,12 +781,19 @@ class Cloth:
 
         return labels     
 
-    def _sim_frame_with_substeps(self):
-        """Basic scheme for simulating a frame update"""
+    def _sim_frame_with_substeps(self, do_collide=True):
+        """Basic scheme for simulating a frame update.
 
-        wp.sim.collide(self.model, self.state_0, self.sim_dt * self.sim_substeps)  # Generates contact points for the particles and rigid bodies
-        # in the model, to be used in the contact dynamics kernel of the integrator
-        # launches kernels
+        do_collide=False reuses the contact set generated on an earlier frame
+        (see config.collide_interval). Contact detection is ~half the frame
+        cost, and near equilibrium the cloth barely moves between frames, so
+        the pairs stay valid; the integrator still recomputes contact FORCES
+        from current positions every substep.
+        """
+        if do_collide:
+            wp.sim.collide(self.model, self.state_0, self.sim_dt * self.sim_substeps)  # Generates contact points for the particles and rigid bodies
+            # in the model, to be used in the contact dynamics kernel of the
+            # integrator; launches kernels
 
         for s in range(self.sim_substeps):
             self.state_0.clear_forces()  # set particle and body forces to 0s
@@ -785,9 +812,38 @@ class Cloth:
         self.graph = wp.capture_end()  # returns a handle to a CUDA graph object that can be launched with :func:`~warp.capture_launch()`
         # do not capture kernel launches anymore
 
+        # A frame that reuses contacts is a different kernel sequence, so it
+        # needs its own graph. Captured only when striding is enabled.
+        self.graph_nocollide = None
+        if getattr(self.config, 'collide_interval', 1) > 1:
+            wp.capture_begin()
+            self._sim_frame_with_substeps(do_collide=False)
+            self.graph_nocollide = wp.capture_end()
+
     def update(self, frame):
         with wp.ScopedTimer("simulate", print=False, active=True):
-            if self.model.enable_particle_particle_collisions:
+            # Contact detection can run less often than integration: it is ~half
+            # the frame, and the contact set stays usable for a few frames once
+            # the cloth is moving slowly.
+            # The particle grid is strided along with it: rebuilding the grid
+            # against a stale contact set measured WORSE for self-intersections
+            # (41 vs 20 at interval 4), and the rebuild costs nothing anyway.
+            # Striding starts at collide_stride_start_frame -- contacts change
+            # fastest during the initial settle, so striding there is where the
+            # self-intersections come from.
+            interval = max(1, int(getattr(self.config, 'collide_interval', 1)))
+            stride_from = int(getattr(self.config, 'collide_stride_start_frame', 0))
+            if interval == 1 or frame < stride_from:
+                do_collide = True
+            elif getattr(self.config, 'collide_interval_adaptive', False):
+                # Stride in proportion to how still the cloth is: detect every
+                # frame while it is moving fast (where a stale contact set does
+                # real damage) and stride hard once it is only creeping.
+                do_collide = self._frames_since_collide >= self._adaptive_interval(interval)
+            else:
+                do_collide = (frame % interval == 0)
+            self._frames_since_collide = 0 if do_collide else self._frames_since_collide + 1
+            if self.model.enable_particle_particle_collisions and do_collide:
                 # FIXME: Produces cuda errors when activated together with "enable_cloth_reference_drag"
                 # Reason is unknown. Or not?
                 self.model.particle_grid.build(self.state_0.particle_q, self.model.particle_max_radius * 2.0)
@@ -814,10 +870,13 @@ class Cloth:
                     self.create_graph()
             
             if self.sim_use_graph: #GPU
-                wp.capture_launch(self.graph)
+                if do_collide or getattr(self, 'graph_nocollide', None) is None:
+                    wp.capture_launch(self.graph)
+                else:
+                    wp.capture_launch(self.graph_nocollide)
 
             else: #CPU: launch kernels without graph
-                self._sim_frame_with_substeps()
+                self._sim_frame_with_substeps(do_collide=do_collide)
 
             # Update vertices of last frame. Only advance when a snapshot was
             # actually taken -- with a strided static check the previous frames
@@ -834,6 +893,12 @@ class Cloth:
                 # NOTE Makes a copy if particle_q device is not CPU
                 self._verts_np = wp.array.numpy(self.state_0.particle_q)
                 self._verts_frame = frame
+                if self.last_verts is not None:
+                    # Max per-vertex L1 displacement: the same measure
+                    # is_static() uses, so it is on the same scale as
+                    # static_threshold. Drives adaptive collide striding.
+                    self._last_motion = float(np.abs(
+                        self._verts_np - self.last_verts).sum(axis=1).max())
             
     # def _restore_body_feet(self):
     #     """Restore original body vertices (with feet) after zero-gravity."""

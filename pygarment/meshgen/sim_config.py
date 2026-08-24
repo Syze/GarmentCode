@@ -121,6 +121,21 @@ class SimConfig:
         # Drop body-collider FACES the garment cannot reach (above its initial
         # top + margin, in cm). Shrinks the BVH that collide() queries every
         # frame; the full vertex array is kept, so nothing else changes.
+        # Run contact detection every Nth frame and reuse the contact set in
+        # between (1 = every frame, current behaviour). Contact FORCES are still
+        # recomputed every substep from live positions -- only the pair list is
+        # reused. Pair with a larger soft_contact_margin so contacts are found
+        # before they are needed.
+        self.collide_interval = max(1, int(self.get_sim_props_value(
+            sim_props_option, 'collide_interval', 1)))
+        # Vary the collide interval with measured cloth motion, using
+        # collide_interval as the ceiling.
+        self.collide_interval_adaptive = self.get_sim_props_value(
+            sim_props_option, 'collide_interval_adaptive', False)
+        # Collide every frame until this frame, then start striding. Contacts
+        # change fastest during the initial settle/stitching phase.
+        self.collide_stride_start_frame = self.get_sim_props_value(
+            sim_props_option, 'collide_stride_start_frame', 0)
         self.body_collider_cull = self.get_sim_props_value(
             sim_props_option, 'body_collider_cull', False)
         self.body_collider_cull_margin = self.get_sim_props_value(
