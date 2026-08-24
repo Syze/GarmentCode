@@ -118,6 +118,13 @@ class SimConfig:
         self.zero_gravity_steps = self.get_sim_props_value(sim_props, 'zero_gravity_steps', 5)
         self.resolution_scale = self.get_sim_props_value(sim_props, 'resolution_scale', 1.0)
         self.ground = self.get_sim_props_value(sim_props, 'ground', True)
+        # Drop body-collider FACES the garment cannot reach (above its initial
+        # top + margin, in cm). Shrinks the BVH that collide() queries every
+        # frame; the full vertex array is kept, so nothing else changes.
+        self.body_collider_cull = self.get_sim_props_value(
+            sim_props_option, 'body_collider_cull', False)
+        self.body_collider_cull_margin = self.get_sim_props_value(
+            sim_props_option, 'body_collider_cull_margin', 15.0)
         # Perf: evaluate the static-equilibrium check every N frames instead of
         # every frame (the check needs a GPU->CPU vertex readback, which
         # serialises the sim pipeline). is_static() scales its threshold by the
@@ -302,7 +309,12 @@ class SimConfig:
             sim_props_material,'spring_kd', 10.0)
 
         # Soft contact properties (contact between cloth and body)
-        self.soft_contact_margin = 0.2 
+        # Broadphase margin for particle-vs-body contacts: the search radius
+        # that decides how many candidate contacts collide() generates each
+        # frame. Smaller = less collision work, but too small and fast-moving
+        # cloth can tunnel through the body between steps.
+        self.soft_contact_margin = self.get_sim_props_value(
+            sim_props_option, 'soft_contact_margin', 0.2)
         self.soft_contact_ke = 1000.0 
         self.soft_contact_kd = 10.0 
         self.soft_contact_kf = 1000.0 

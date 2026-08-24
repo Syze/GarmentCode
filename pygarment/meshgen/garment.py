@@ -288,7 +288,34 @@ class Cloth:
             self.body_vertices_device_buffer = wp.array(
                 body_vertices, dtype=wp.vec3, device=self.device)
 
-        self.body_mesh = wp.sim.Mesh(body_vertices, body_indices)
+        # ----- Body collider culling (optional) -----
+        # wp.sim.collide queries a BVH over every body triangle each frame, but
+        # a garment can only ever touch part of the body -- pants cannot reach
+        # the head, arms or hands. Dropping the unreachable FACES (keeping the
+        # full vertex array, so vertex indices and replace_mesh_points stay
+        # valid) shrinks the BVH without changing anything the cloth can touch.
+        # Conservative: a face survives if ANY of its vertices sits at or below
+        # the garment's initial top plus a margin, and the cloth only ever
+        # falls from there under gravity.
+        self._collider_face_mask = None
+        self._collider_y_max = None
+        collider_indices = body_indices
+        if getattr(config, 'body_collider_cull', False):
+            tris = np.asarray(body_indices).reshape(-1, 3)
+            margin = float(getattr(config, 'body_collider_cull_margin', 15.0))
+            y_max = float(cloth_vertices[:, 1].max()) + margin
+            keep = body_vertices[tris, 1].min(axis=1) <= y_max
+            n_keep = int(keep.sum())
+            if 4 <= n_keep < len(keep):
+                collider_indices = tris[keep].reshape(-1)
+                self._collider_face_mask = keep
+                self._collider_y_max = y_max
+                print(f'  Body collider culled to {n_keep}/{len(keep)} faces '
+                      f'({100.0 * n_keep / len(keep):.0f}%), keeping Y <= {y_max:.1f} cm')
+            else:
+                print(f'  Body collider cull skipped (would keep {n_keep}/{len(keep)} faces)')
+
+        self.body_mesh = wp.sim.Mesh(body_vertices, collider_indices)
 
         # ----- Body pose animation (optional) -----
         # Step the body through a pose sequence during the sim so the cloth
@@ -335,10 +362,16 @@ class Cloth:
         
         face_filters, particle_filter = [], []
         if config.enable_body_collision_filters:
+            # create_face_filter returns one bool per triangle in face order,
+            # so a culled collider needs its filters culled to match.
+            def _mask_filter(flt):
+                if self._collider_face_mask is None:
+                    return flt
+                return [f for f, keep in zip(flt, self._collider_face_mask) if keep]
             v_connectivity = self._build_vert_connectivity(cloth_vertices, cloth_indices)
             # Arm filter for the skirts
-            face_filters.append(assign.create_face_filter(
-                body_vertices, body_indices, body_seg, ['left_arm', 'right_arm', 'arms'], smpl_body=self.paths.use_smpl_seg))
+            face_filters.append(_mask_filter(assign.create_face_filter(
+                body_vertices, body_indices, body_seg, ['left_arm', 'right_arm', 'arms'], smpl_body=self.paths.use_smpl_seg)))
             particle_filter = assign.assign_face_filter_points(
                 cloth_reference_labels, 
                 ['left_leg', 'right_leg', 'legs'],
@@ -356,8 +389,8 @@ class Cloth:
             is_lower_body = has_leg_panels and not has_arm_panels
             if is_lower_body or has_arm_panels:
                 body_filter_parts.extend(['left_arm', 'right_arm', 'arms'])
-            face_filters.append(assign.create_face_filter(
-                body_vertices, body_indices, body_seg, body_filter_parts, smpl_body=self.paths.use_smpl_seg))
+            face_filters.append(_mask_filter(assign.create_face_filter(
+                body_vertices, body_indices, body_seg, body_filter_parts, smpl_body=self.paths.use_smpl_seg)))
             particle_filter = assign.assign_face_filter_points(
                 cloth_reference_labels,
                 ['body'],

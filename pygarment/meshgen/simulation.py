@@ -430,6 +430,18 @@ def run_sim(
         if time.time() - start_time < 0.5:  # 0.5 sec  -- finished suspiciously fast
             props.add_fail('sim', 'fast_finish', cloth_name)
 
+        # A culled body collider is only valid while the cloth stays inside the
+        # band that was kept. If it climbed out, contacts up there silently did
+        # not exist -- say so rather than shipping a quietly wrong drape.
+        y_cap = getattr(garment, '_collider_y_max', None)
+        if y_cap is not None:
+            cloth_top = float(garment.current_verts[:, 1].max())
+            if cloth_top > y_cap:
+                print(f'{cloth_name}::WARNING::cloth reached Y={cloth_top:.1f} cm but the '
+                      f'body collider was culled above Y={y_cap:.1f} cm -- raise '
+                      f'body_collider_cull_margin or disable body_collider_cull')
+                props.add_fail('sim', 'collider_cull_exceeded', cloth_name)
+
         # 3D penetrations
         num_body_collisions = garment.count_body_intersections()
         print("BODY CLOTH INTERSECTIONS: ", num_body_collisions)
