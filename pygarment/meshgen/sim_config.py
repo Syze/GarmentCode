@@ -108,8 +108,12 @@ class SimConfig:
         sim_props_material = sim_props['material']
 
         # Basic setup
-        self.sim_fps = 60.0
-        self.sim_substeps = 10 #increase?
+        # Integration step: sim_dt = (1/sim_fps)/sim_substeps. Lowering
+        # sim_substeps (or raising sim_fps) enlarges dt -- fewer solver
+        # iterations per simulated second, at the cost of explicit-integrator
+        # stability. Exposed for perf tuning; defaults are the historic values.
+        self.sim_fps = self.get_sim_props_value(sim_props, 'sim_fps', 60.0)
+        self.sim_substeps = self.get_sim_props_value(sim_props, 'sim_substeps', 10)
         self.sim_wo_gravity_percentage = 0
         self.zero_gravity_steps = self.get_sim_props_value(sim_props, 'zero_gravity_steps', 5)
         self.resolution_scale = self.get_sim_props_value(sim_props, 'resolution_scale', 1.0)
