@@ -294,7 +294,8 @@ def sim_frame_sequence(garment, config, store_usd=False, verbose=False,
             except Exception:
                 pass
 
-        if frame >= config.zero_gravity_steps and frame >= config.min_sim_steps:
+        if (frame >= config.zero_gravity_steps and frame >= config.min_sim_steps
+                and (frame - config.zero_gravity_steps) % config.static_check_interval == 0):
             static, _ = garment.is_static()
         if static:
             break

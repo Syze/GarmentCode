@@ -103,7 +103,25 @@ class Cloth:
             self.create_graph()
 
         self.last_verts = None
+        self._verts_np = None
+        self._verts_frame = -1
+        self._last_verts_frame = None
         self.current_verts = wp.array.numpy(self.state_0.particle_q)
+
+    @property
+    def current_verts(self):
+        """Particle positions as numpy, fetched from the device on first use
+        in a frame. The readback is a full GPU->CPU sync, so with
+        config.lazy_vert_fetch it happens only when a consumer asks."""
+        if self._verts_np is None:
+            self._verts_np = wp.array.numpy(self.state_0.particle_q)
+            self._verts_frame = self.frame
+        return self._verts_np
+
+    @current_verts.setter
+    def current_verts(self, value):
+        self._verts_np = value
+        self._verts_frame = self.frame
 
     def build_stage(self, config):
 
@@ -768,10 +786,21 @@ class Cloth:
             else: #CPU: launch kernels without graph
                 self._sim_frame_with_substeps()
 
-            # Update vertices of last frame
-            self.last_verts = self.current_verts
-            # NOTE Makes a copy if particle_q device is not CPU
-            self.current_verts = wp.array.numpy(self.state_0.particle_q)  
+            # Update vertices of last frame. Only advance when a snapshot was
+            # actually taken -- with a strided static check the previous frames
+            # hold no readback, and clobbering last_verts with None would make
+            # is_static() unable to ever compare (and so never terminate).
+            if self._verts_np is not None:
+                self.last_verts = self._verts_np
+                self._last_verts_frame = self._verts_frame
+            if self.config.lazy_vert_fetch:
+                # Deferred: the property fetches on demand (static check,
+                # video capture, final save), so quiet frames cost no sync.
+                self._verts_np = None
+            else:
+                # NOTE Makes a copy if particle_q device is not CPU
+                self._verts_np = wp.array.numpy(self.state_0.particle_q)
+                self._verts_frame = frame
             
     # def _restore_body_feet(self):
     #     """Restore original body vertices (with feet) after zero-gravity."""
@@ -938,7 +967,12 @@ class Cloth:
             Checks whether garment is in the static equilibrium
             Compares current state with the last recorded state
         """
-        threshold = self.config.static_threshold
+        # last_verts may be more than one frame old (strided static checks /
+        # lazy readback); the criterion is per-frame displacement, so scale.
+        gap = 1
+        if self._last_verts_frame is not None and self.frame > self._last_verts_frame:
+            gap = self.frame - self._last_verts_frame
+        threshold = self.config.static_threshold * gap
         non_static_percent = self.config.non_static_percent
 
         curr_verts_arr = self.current_verts

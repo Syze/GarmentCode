@@ -118,6 +118,17 @@ class SimConfig:
         self.zero_gravity_steps = self.get_sim_props_value(sim_props, 'zero_gravity_steps', 5)
         self.resolution_scale = self.get_sim_props_value(sim_props, 'resolution_scale', 1.0)
         self.ground = self.get_sim_props_value(sim_props, 'ground', True)
+        # Perf: evaluate the static-equilibrium check every N frames instead of
+        # every frame (the check needs a GPU->CPU vertex readback, which
+        # serialises the sim pipeline). is_static() scales its threshold by the
+        # frame gap, so the per-frame displacement criterion is preserved.
+        self.static_check_interval = max(1, int(self.get_sim_props_value(
+            sim_props, 'static_check_interval', 1)))
+        # Perf: only read particle positions back to the CPU when something
+        # actually consumes them (static check, video frame, final save)
+        # instead of unconditionally every frame.
+        self.lazy_vert_fetch = self.get_sim_props_value(
+            sim_props, 'lazy_vert_fetch', False)
 
         # Stopping criteria 
         self.static_threshold = self.get_sim_props_value(sim_props, 'static_threshold', 0.01)
