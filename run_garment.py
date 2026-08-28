@@ -63,8 +63,15 @@ def run_pipeline(config):
     )
 
     # Import garment-type-specific functions
+    # Which module owns the DXF builders. `hyperdrop` for the Hyperdrop styles,
+    # `bonprix` for the bonprix ones; both expose the same generate_pattern
+    # signature and read their style name from a config section of their own
+    # name, so adding a supplier does not touch this dispatcher again.
+    dxf_module = config.get('pattern_module', 'hyperdrop')
     if dxf_pattern:
-        from assets.garment_programs.hyperdrop import generate_pattern
+        import importlib
+        generate_pattern = importlib.import_module(
+            f'assets.garment_programs.{dxf_module}').generate_pattern
         map_production_to_design = None
     elif garment_type == 'shirt':
         from run_custom_tshirt import (
@@ -106,7 +113,8 @@ def run_pipeline(config):
     print("=" * 60)
     print(f"  Garment Pipeline: {config.get('name', garment_prefix)}")
     print(f"  Type: {garment_type}"
-          + (f" (pattern from DXF: {config['hyperdrop']['style']})" if dxf_pattern else ""))
+          + (f" (pattern from DXF: {dxf_module}/"
+             f"{config.get(dxf_module, {}).get('style')})" if dxf_pattern else ""))
     print(f"  Body: {body_name}")
     print(f"  Sizes: {sizes_to_run}")
     print(f"  GPU: CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'not set')}")

@@ -539,7 +539,7 @@ class ProductionToDesign:
 
         # Rise: how high the waistband sits (1.0 = natural waist, >1.0 = high-rise)
         rise_v = garment.get('rise', 1.0)
-        rise_v = np.clip(rise_v, 0.2, 1.5)   # low bound 0.2 enables true low-rise (was 0.5, which floored the front rise ~18.9cm)
+        rise_v = np.clip(rise_v, 0.2, 1.8)   # low bound 0.2 enables true low-rise (was 0.5, which floored the front rise ~18.9cm); upper 1.8 matches the fitter's RISE_MAX (was 1.5, a silent plateau that stalled the rise fit on short bodies)
 
         # Crotch-to-knee distance override from production data (cm)
         crotch_to_knee = garment.get('crotch_to_knee')

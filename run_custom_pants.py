@@ -22,6 +22,8 @@ from datetime import datetime
 import json
 import xml.etree.ElementTree as ET
 
+import contextlib
+import io
 import numpy as np
 import yaml
 import cairosvg
@@ -924,6 +926,92 @@ def _fit_rise_parameters(prod, body_yaml_path, base_garment_measurements,
     return rise_v, front_fraction, back_lift
 
 
+def _inseam_arc_length(panels, stitches):
+    """Arc length of the inseam chain on the right leg (pant_f_r <-> pant_b_r).
+
+    Same predicate as verify_measurements: an edge stitched to pant_b_r, on the
+    high-X (inner) side of the panel, with vertical extent -- which excludes the
+    horizontal crotch U-curve. With leg subcurves the chain is up to 3 edges.
+    """
+    stitch_map = {}
+    for stitch in stitches:
+        sides = [sd for sd in stitch if isinstance(sd, dict)]
+        if len(sides) == 2:
+            a, b = sides
+            stitch_map[(a['panel'], a['edge'])] = (b['panel'], b['edge'])
+            stitch_map[(b['panel'], b['edge'])] = (a['panel'], a['edge'])
+    pant_fr, pant_br = panels.get('pant_f_r'), panels.get('pant_b_r')
+    if not (pant_fr and pant_br):
+        return None
+    verts = pant_fr['vertices']
+    centroid_x = np.mean([v[0] for v in verts])
+    total = 0.0
+    for i, e in enumerate(pant_fr['edges']):
+        partner = stitch_map.get(('pant_f_r', i))
+        if partner and partner[0] == 'pant_b_r':
+            ep = e['endpoints']
+            v1, v2 = verts[ep[0]], verts[ep[1]]
+            if (v1[0] + v2[0]) / 2 > centroid_x and abs(v1[1] - v2[1]) > 1.0:
+                total += edge_length(e, verts)
+    return total if total > 0 else None
+
+
+def _fit_panel_length(target_inseam, make_design, body_params, length0,
+                      tol=0.05, max_iter=4):
+    """Solve panel `length` so the measured inseam arc hits the production target.
+
+    `length` is an independent knob. Every other POM is anchored to the crotch or
+    the waist seam -- Thigh at crotch level, Knee at crotch - Knee_from_crotch, Hip
+    at waist_seam - Hip_from_waist, both rises are center-seam arcs -- and the hem
+    WIDTH comes from leg_opening, so moving the hem changes the inseam and nothing
+    else. Verified by sweeping length over +/-2cm on 1347201: Waist/Hip/Thigh/Knee/
+    Ankle/Front Rise/Back Rise identical to 2dp at every step.
+
+    Why the loop is needed: `Inseam + crotch_hip_diff` assumes the inseam is a
+    straight vertical drop, but it is measured as an ARC over up to three
+    subcurves, so it always lands long -- +0.2cm on straight legs, up to +1.8cm on
+    strongly-curved wide legs (1347201, 1357712). Response is near-linear
+    (measured slope ~0.95), so one or two Newton steps converge.
+    """
+    from assets.garment_programs.meta_garment import MetaGarment
+
+    def measure(length):
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                pattern = MetaGarment('_len', body_params, make_design(length)).assembly()
+        except (AssertionError, ValueError, ZeroDivisionError):
+            return None
+        return _inseam_arc_length(pattern.pattern['panels'], pattern.pattern['stitches'])
+
+    length = float(length0)
+    m = measure(length)
+    if m is None:
+        print('  Inseam fit: pattern build failed at the open-loop length; '
+              'keeping it unchanged')
+        return float(length0)
+    slope = 0.95            # d(arc)/d(length), refined from observed steps
+    best_err, best_len, best_m = abs(m - target_inseam), length, m
+    for _ in range(max_iter):
+        if abs(m - target_inseam) <= tol:
+            break
+        step = (target_inseam - m) / slope
+        step = max(-10.0, min(10.0, step))       # never leap out of feasibility
+        cand = length + step
+        m_new = measure(cand)
+        if m_new is None:
+            break
+        obs = (m_new - m) / (cand - length) if abs(cand - length) > 1e-9 else None
+        if obs is not None and 0.5 < obs < 1.5:
+            slope = obs
+        length, m = cand, m_new
+        if abs(m - target_inseam) < best_err:
+            best_err, best_len, best_m = abs(m - target_inseam), length, m
+    print(f'  Inseam fit: length={best_len:.2f} -> arc {best_m:.2f}cm '
+          f'(target {target_inseam:.1f}, {best_m - target_inseam:+.2f}); '
+          f'open-loop was {length0:.2f}')
+    return float(best_len)
+
+
 def map_production_to_design(prod, body_yaml_path, elastic_waistband=False,
                              balloon_leg=False, cuff_inseam_fraction=None,
                              cuff_ease=1.0, elastic_waist_gather=False,
@@ -1004,8 +1092,35 @@ def map_production_to_design(prod, body_yaml_path, elastic_waistband=False,
         # Fall back: use average of available rise values
         rises = [v for k, v in prod.items() if 'Rise' in k and v is not None]
         rise_v = (sum(rises) / len(rises) - body['crotch_hip_diff']) / body['hips_line'] if rises else 1.0
-        garment_measurements['rise'] = float(np.clip(rise_v, 0.5, 1.5))
+        garment_measurements['rise'] = float(np.clip(rise_v, 0.2, 1.8))
         design = mapper.map_pants(garment_measurements)
+
+    # Close the loop on the inseam. `panel_length` above is open-loop
+    # (Inseam + crotch_hip_diff) and always lands long, because the inseam is
+    # verified as an ARC over the leg subcurves rather than a vertical drop.
+    # Fitting `length` moves only the hem, so no other POM is affected
+    # (see _fit_panel_length). Skipped for cuffed/balloon legs, where the cuff
+    # logic redefines what `length` means at the hem.
+    if prod.get('Inseam') and not balloon_leg and cuff_inseam_fraction is None:
+        from assets.bodies.body_params import BodyParameters
+        _body_params = BodyParameters(body_yaml_path)
+        _pants_ovr = (design_overrides or {}).get('pants') or {}
+
+        def _make_design(_length):
+            _gm = dict(garment_measurements)
+            _gm['length'] = float(_length)
+            _d = mapper.map_pants(_gm)
+            if 'Front Rise' in prod and 'Back Rise' in prod:
+                _d['pants']['front_crotch_fraction'] = {'v': float(front_fraction)}
+                _d['pants']['back_rise_lift'] = {'v': float(back_lift)}
+            if _pants_ovr:
+                _merge_design(_d.setdefault('pants', {}), _pants_ovr)
+            return _d
+
+        panel_length = _fit_panel_length(
+            prod['Inseam'], _make_design, _body_params, panel_length)
+        garment_measurements['length'] = float(panel_length)
+        design = _make_design(panel_length)
 
     # Balloon leg: attach a gathered cuff pinned to the Ankle circumference.
     # The wide leg bottom (driven by Knee above) blouses into this narrow band.
@@ -1084,7 +1199,9 @@ def _apply_pose_x_rotation(folder, body_obj_path,
                            bot_band_floor=0.0,
                            min_angle_deg=0.5,
                            back_rise_lift=0.0,
-                           extra_x_sep=0.0):
+                           extra_x_sep=0.0,
+                           foot_guard=8.0,
+                           cuff_align=False):
     """Per-leg translation + Z rotation to align pant legs with diagonally
     asymmetric body legs (HM-style A-pose bodies). Each leg's two panels (front
     + back) translate and rotate as a rigid pair around their shared top-center
@@ -1243,6 +1360,77 @@ def _apply_pose_x_rotation(folder, body_obj_path,
         apply_rigid(panels[n], shift_L, theta_L, pivot_L_x)
     for n in right_grp:
         apply_rigid(panels[n], shift_R, theta_R, pivot_R_x)
+
+    # --- cuffs get their OWN alignment ------------------------------------
+    # The leg above is one rigid transform aimed from a thigh band to a shin
+    # band, so it can only be right on average: a single rotation cannot follow
+    # a leg that changes direction down its length. At the ankle -- the far end
+    # from the pivot -- the residual is the largest, and that is exactly where
+    # the cuffs sit. So each cuff group is re-placed against the body in ITS OWN
+    # y band, with a tilt measured locally across that band rather than the
+    # leg's average. The cuff's top stays the pivot, since that is the edge
+    # welded to the leg hem.
+    def _rigid_about(panel, shift_x, dtheta, piv_x, piv_y):
+        rot_piv_x = piv_x + shift_x
+        tx, ty, tz = panel['translation']
+        tx += shift_x
+        dx, dy = tx - rot_piv_x, ty - piv_y
+        c, s = math.cos(dtheta), math.sin(dtheta)
+        panel['translation'] = [rot_piv_x + dx * c - dy * s,
+                                piv_y + dx * s + dy * c, tz]
+        rx, ry, rz = panel['rotation']
+        panel['rotation'] = [rx, ry, rz + math.degrees(dtheta)]
+
+    def _world_xy(panel):
+        ang = math.radians(panel['rotation'][2])
+        c, s = math.cos(ang), math.sin(ang)
+        tx, ty = panel['translation'][0], panel['translation'][1]
+        return [(tx + v[0] * c - v[1] * s, ty + v[0] * s + v[1] * c)
+                for v in panel['vertices']]
+
+    for side in ('l', 'r') if cuff_align else ():
+        grp = [n for n in panels if f'{side}_cuff' in n]
+        if not grp:
+            continue
+        pts = [q for n in grp for q in _world_xy(panels[n])]
+        y_hi, y_lo = max(q[1] for q in pts), min(q[1] for q in pts)
+        top_xs = [q[0] for q in pts if q[1] >= y_hi - 0.5]
+        piv_x, piv_y = sum(top_xs) / len(top_xs), y_hi
+        # Sampling has to stay ABOVE the feet. On this A-pose body the left foot
+        # splays hard: the leg centre reads +25.83 in y=[0,5] against +18.77 in
+        # y=[5,10], a 7 cm jump, and above y~10 the profile is smooth and nearly
+        # linear. Taking the band below the cuff (pure foot) gave a 25.9 deg tilt
+        # and a 9.9 cm shift -- the same trap the leg's fixed shin band exists to
+        # avoid. So the target and the tilt are both read from bands above
+        # `foot_guard`, and extrapolated down to the cuff.
+        i = 0 if side == 'l' else 1
+        lo_s = max(y_lo, foot_guard)
+        hi_s = max(y_hi, lo_s + 4.0)
+        here = _body_leg_x_centers(body_obj_path, lo_s, hi_s)
+        if here[0] is None:
+            print(f'  Cuff-align {side}: skipped (no body samples in '
+                  f'[{lo_s:.1f}, {hi_s:.1f}])')
+            continue
+        target = here[i]
+        span = max(6.0, y_hi - y_lo)
+        lower = _body_leg_x_centers(body_obj_path, lo_s, lo_s + span)
+        upper = _body_leg_x_centers(body_obj_path, lo_s + span, lo_s + 2 * span)
+        theta = 0.0
+        if lower[0] is not None and upper[0] is not None:
+            theta = math.atan2(lower[i] - upper[i], span)
+        # ROTATION ONLY, about the cuff's own top edge. Re-centring it on the
+        # body's leg centre as well was wrong: in the flat layout the front and
+        # back cuffs straddle the leg at z = +/-, so neither one's x centre is
+        # meant to sit on the body's axis -- asking for that gave a 12.3 cm shift
+        # on the left and took self-intersections from 22 to 91. The top edge is
+        # welded to the leg hem, so keeping it put and only re-aiming the cuff
+        # down the body's LOCAL leg direction is the correction that was missing.
+        cur = math.radians(panels[grp[0]]['rotation'][2])
+        print(f'  Cuff-align {side}: band y=[{y_lo:.1f},{y_hi:.1f}] '
+              f'body x {target:+.2f} (cuff {piv_x:+.2f}), '
+              f'tilt {math.degrees(cur):+.2f}->{math.degrees(theta):+.2f} deg')
+        for n in grp:
+            _rigid_about(panels[n], 0.0, theta - cur, piv_x, piv_y)
 
     with open(spec_path, 'w') as f:
         json.dump(spec, f, indent=2)
@@ -1471,10 +1659,19 @@ def _place_pattern_for_body(spec_file, body_name, output_base, placement):
           f'-> {placed_folder}')
 
     if body_obj.exists():
+        _kw = {}
+        # A garment may raise the lower sampling band off the floor. Needed when
+        # the body's feet splay: on the bonprix custom pose the left leg centre
+        # reads +23.39 over the default y=[0,20] band but +17.26 over y=[8,20],
+        # so the leg gets aimed 6 cm outboard -- past the ankle, at the foot --
+        # and the ankle rib lands 4.5 cm beside the ankle instead of round it.
+        for k in ('bot_band_floor', 'bot_band_height'):
+            if placement.get(k) is not None:
+                _kw[k] = float(placement[k])
         _apply_pose_x_rotation(
             placed_folder, body_obj,
             back_rise_lift=float(placement.get('back_rise_lift', 0.0) or 0.0),
-            extra_x_sep=float(placement.get('extra_x_sep', 0.0) or 0.0))
+            extra_x_sep=float(placement.get('extra_x_sep', 0.0) or 0.0), **_kw)
     else:
         print(f'  Pose-X skipped (no body OBJ at {body_obj})')
     return placed_folder
@@ -1735,23 +1932,8 @@ def verify_measurements(spec_path, size, prod, body_yaml=None, elastic_waistband
     # (low X). The crotch U-curve is also stitched but is horizontal at crotch level.
     # We identify inseam by: stitched to pant_b_r, mean X > panel centroid X,
     # and NOT horizontal (i.e., has vertical extent — excludes crotch curve).
-    inseam = 0.0
-    pant_fr = panels.get('pant_f_r')
-    pant_br = panels.get('pant_b_r')
-    if pant_fr and pant_br:
-        fr_verts = pant_fr['vertices']
-        centroid_x = np.mean([v[0] for v in fr_verts])
-        for i, e in enumerate(pant_fr['edges']):
-            partner = stitch_map.get(('pant_f_r', i))
-            if partner and partner[0] == 'pant_b_r':
-                ep = e['endpoints']
-                v1, v2 = fr_verts[ep[0]], fr_verts[ep[1]]
-                mean_x = (v1[0] + v2[0]) / 2
-                dy = abs(v1[1] - v2[1])
-                # Inseam: on the right (high-X) side and has vertical extent
-                if mean_x > centroid_x and dy > 1.0:
-                    inseam += edge_length(e, fr_verts)
-    results['Inseam'] = inseam if inseam > 0 else None
+    # Shared with the length fitter so the two cannot drift apart.
+    results['Inseam'] = _inseam_arc_length(panels, stitches)
 
     # --- Cross-section circumferences (Thigh, Knee, Hip) ---
     # Crotch height = U bottom = tip of center-front seam (pant_f_l ↔ pant_f_r).
