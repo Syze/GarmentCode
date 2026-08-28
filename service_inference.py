@@ -52,6 +52,9 @@ from pydantic import BaseModel
 REPO_ROOT = Path(__file__).resolve().parent
 SERVICE_OUTPUT_DIRNAME = 'service'
 WORKER_RESULT_FILE = 'worker_result.json'
+# Total sim attempts per job: a run that hits max_sim_steps without
+# reaching static equilibrium is retried once from scratch.
+MAX_SIM_ATTEMPTS = 2
 
 
 def _load_system_config():
@@ -162,7 +165,7 @@ SERVER_CONFIG = {
     # Classic SMPL model pkls (SMPL_FEMALE.pkl / SMPL_MALE.pkl) and per-gender
     # custom pose files ({gender}.txt, 72 axis-angle values), used to
     # auto-generate missing bodies via the repo's numpy implementation in
-    # smpl_pose.py.
+    # make_pose_sequence.py.
     'smpl_models_dir': '../swan-comfyui/Muse/models/smpl',
     'smpl_poses_dir': '../swan-comfyui/Muse/poses_smpl',
 }
@@ -384,7 +387,7 @@ def _generate_smpl_body(base_path: Path, model_pkl: str, pose_file: str,
                         betas=None, height=None):
     """Generate an SMPL body pair: {base}_apose.obj and {base}_custompose.obj.
 
-    Uses the repo's numpy SMPL implementation (smpl_pose.py), the A-pose
+    Uses the repo's numpy SMPL implementation (make_pose_sequence.py), the A-pose
     definition shared with the pose-animation tooling, and the per-gender
     custom pose (72 axis-angle values) from pose_file. Both meshes are in
     metres and share the A-pose Y-shift (feet at Y=0 in A-pose), matching
@@ -394,8 +397,7 @@ def _generate_smpl_body(base_path: Path, model_pkl: str, pose_file: str,
     """
     import numpy as np
     import trimesh
-    from smpl_pose import load_smpl, smpl_forward
-    from make_pose_sequence import THETA_A
+    from make_pose_sequence import load_smpl, smpl_forward, THETA_A
 
     betas = np.asarray(betas if betas is not None else np.zeros(10), dtype=np.float64)
     model = load_smpl(model_pkl)
@@ -472,11 +474,22 @@ def _sim_worker_entry(payload: dict):
 # Dispatcher (single worker thread in the server process)
 # ============================================================
 
-def _resolve_outcome(job: Job, exitcode: Optional[int]):
-    """Decide the job outcome from artifacts on disk + the child exitcode."""
-    combined = sorted(job.output_base.glob('*/combined.obj'))
-    sim_folders = sorted(p for p in job.output_base.iterdir() if p.is_dir())
-    timeout_markers = sorted(job.output_base.glob('*/_TIMEOUT'))
+def _resolve_outcome(job: Job, exitcode: Optional[int], ignore_dirs=()):
+    """Decide the job outcome from artifacts on disk + the child exitcode.
+
+    ignore_dirs holds subfolder names of output_base that predate this
+    attempt (earlier attempts' sim folders, the placed-pattern folder). They
+    are skipped so a retry is never resolved against a previous run's meshes.
+    """
+    def fresh(paths):
+        return sorted(p for p in paths if p.parent.name not in ignore_dirs)
+
+    combined = fresh(job.output_base.glob('*/combined.obj'))
+    sim_folders = sorted(p for p in job.output_base.iterdir()
+                         if p.is_dir() and p.name not in ignore_dirs)
+    timeout_markers = fresh(job.output_base.glob('*/_TIMEOUT'))
+
+    job.sim_folder, job.warnings, job.error = None, [], None
 
     worker_result = None
     result_file = job.output_base / WORKER_RESULT_FILE
@@ -557,22 +570,46 @@ def _run_job(mp_ctx, job_id):
 
     job.output_base.mkdir(parents=True, exist_ok=True)
     t_start = time.monotonic()
-    proc = mp_ctx.Process(
-        target=_sim_worker_entry,
-        args=({**job.payload, 'output_base': str(job.output_base)},),
-        daemon=True,
-    )
-    ACTIVE_PROCESS['proc'], ACTIVE_PROCESS['job_id'] = proc, job_id
-    proc.start()
-    proc.join()
-    ACTIVE_PROCESS['proc'], ACTIVE_PROCESS['job_id'] = None, None
+    for attempt in range(1, MAX_SIM_ATTEMPTS + 1):
+        # Artifacts already on disk belong to earlier attempts (or to the
+        # placed-pattern folder) and must not be mistaken for this run's.
+        stale_dirs = {p.name for p in job.output_base.iterdir() if p.is_dir()}
+        (job.output_base / WORKER_RESULT_FILE).unlink(missing_ok=True)
+
+        proc = mp_ctx.Process(
+            target=_sim_worker_entry,
+            args=({**job.payload, 'output_base': str(job.output_base)},),
+            daemon=True,
+        )
+        ACTIVE_PROCESS['proc'], ACTIVE_PROCESS['job_id'] = proc, job_id
+        proc.start()
+        proc.join()
+        ACTIVE_PROCESS['proc'], ACTIVE_PROCESS['job_id'] = None, None
+
+        with JOBS_LOCK:
+            if STOP_EVENT.is_set() and proc.exitcode not in (0, 124):
+                job.status = JobStatus.failed
+                job.error = 'Server shutdown while job was running'
+                break
+            _resolve_outcome(job, proc.exitcode, ignore_dirs=stale_dirs)
+            # A drape that ran out of steps is worth one more shot: the sim
+            # is not deterministic across runs, and a rerun often settles.
+            retry = (job.status == JobStatus.failed
+                     and 'static_equilibrium' in job.warnings
+                     and attempt < MAX_SIM_ATTEMPTS
+                     and not STOP_EVENT.is_set())
+            if retry:
+                # Decided under the lock and rolled back to running: clients
+                # poll for a terminal status, so the interim failure must
+                # never be observable.
+                job.status = JobStatus.running
+                job.sim_folder, job.warnings, job.error = None, [], None
+        if not retry:
+            break
+        print(f'[job {job_id}] attempt {attempt} hit max_sim_steps '
+              f'without static equilibrium — retrying')
 
     with JOBS_LOCK:
-        if STOP_EVENT.is_set() and proc.exitcode not in (0, 124):
-            job.status = JobStatus.failed
-            job.error = 'Server shutdown while job was running'
-        else:
-            _resolve_outcome(job, proc.exitcode)
         job.finished_at = datetime.now().isoformat(timespec='seconds')
     elapsed = time.monotonic() - t_start
     print(f'[job {job_id}] {job.status.value}'
