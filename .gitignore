@@ -17,9 +17,6 @@ dist
 # Maya
 .mayaSwatches
 
-# custom settings -- to have customized local copy
-system.json
-
 # place to store render scenes
 **/data_generation/Scenes
 
