@@ -1,5 +1,6 @@
 """Helper functions for the triangulation of the panels"""
 
+from collections import deque
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -28,10 +29,12 @@ def mark_domains(ct, start_face, index, edge_border, face_info):
     """
     if face_info[start_face].nesting_level != -1:
         return
-    queue = [start_face]
-    while queue != []:
-        fh = queue[0]  # queue.front
-        queue = queue[1:]  # queue.pop_front
+    # deque: the old `queue = queue[1:]` copied the whole list on every pop,
+    # making this BFS quadratic in the face count. popleft() dequeues the same
+    # element in the same order, so the traversal and its output are identical.
+    queue = deque([start_face])
+    while queue:
+        fh = queue.popleft()
         if face_info[fh].nesting_level == -1:
             face_info[fh].nesting_level = index
             for i in range(3):
@@ -64,9 +67,9 @@ def mark_domain(cdt):
     index = 0
     border = []
     mark_domains(cdt, cdt.infinite_face(), index + 1, border, face_info)
-    while border != []:
-        e = border[0]  # border.front
-        border = border[1:]  # border.pop_front
+    border = deque(border)
+    while border:
+        e = border.popleft()
         n = e[0].neighbor(e[1])
         if face_info[n].nesting_level == -1:
             lvl = face_info[e[0]].nesting_level + 1
