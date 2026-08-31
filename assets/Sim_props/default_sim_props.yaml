@@ -56,7 +56,7 @@ render:
     - 4.15
     uv_texture:
       seam_width: 0.5
-      dpi: 1500
+      dpi: 150
       fabric_grain_texture_path: ./assets/img/fabric_texture.png
       fabric_grain_resolution: 5
   stats: {}
