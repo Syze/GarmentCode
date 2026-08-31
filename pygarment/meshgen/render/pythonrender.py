@@ -234,6 +234,60 @@ def render_frame_to_array(garment_verts, garment_faces, body_v, body_f, render_p
     return color
 
 
+class FrameRenderer:
+    """Reusable offscreen renderer for simulation video frames.
+
+    render_frame_to_array() rebuilds everything per frame -- body mesh, both
+    materials, scene, camera, lights, and a fresh OffscreenRenderer (an EGL
+    context) that it then destroys. Only the garment geometry actually changes
+    between frames, so this class builds the static half once and swaps just
+    the garment node, which is where nearly all of the per-frame cost went.
+
+    Owns a GL context: construct and use it on one thread only.
+    """
+
+    def __init__(self, body_v, body_f, render_props, resolution=None):
+        if resolution is None:
+            resolution = (render_props or {}).get('resolution', (540, 540))
+        self.width, self.height = int(resolution[0]), int(resolution[1])
+
+        body_mesh = trimesh.Trimesh(body_v / 100, body_f)
+        body_material = pyrender.MetallicRoughnessMaterial(
+            baseColorFactor=(0.5, 0.5, 0.5, 1.0),
+            metallicFactor=0.658, roughnessFactor=0.5)
+        pyrender_body = pyrender.Mesh.from_trimesh(body_mesh, material=body_material)
+
+        self.garm_material = pyrender.MetallicRoughnessMaterial(
+            baseColorFactor=(0.12, 0.20, 0.38, 1.0),
+            metallicFactor=0.1, roughnessFactor=0.7, doubleSided=True)
+
+        self.scene = pyrender.Scene(bg_color=(0.85, 0.85, 0.85, 1.))
+        self.scene.add(pyrender_body)
+        create_camera(pyrender, pyrender_body, self.scene, 'front',
+                      camera_location=(render_props or {}).get('front_camera_location'))
+        create_lights(self.scene, intensity=80.)
+
+        self.renderer = pyrender.OffscreenRenderer(
+            viewport_width=self.width, viewport_height=self.height)
+        self.garm_node = None
+
+    def render(self, garment_verts, garment_faces):
+        """Swap in this frame's garment geometry and return an RGBA array."""
+        if self.garm_node is not None:
+            self.scene.remove_node(self.garm_node)
+        mesh = pyrender.Mesh.from_trimesh(
+            trimesh.Trimesh(garment_verts / 100, garment_faces),
+            material=self.garm_material, smooth=True)
+        self.garm_node = self.scene.add(mesh)
+        color, _ = self.renderer.render(self.scene, flags=pyrender.RenderFlags.RGBA)
+        return color
+
+    def close(self):
+        if self.renderer is not None:
+            self.renderer.delete()
+            self.renderer = None
+
+
 def render_images(paths: PathCofig, body_v, body_f, render_props):
 
     pyrender_garm_mesh, pyrender_body_mesh = load_meshes(paths, body_v, body_f)

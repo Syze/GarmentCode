@@ -22,12 +22,15 @@ import platform
 import multiprocessing
 import signal
 import trimesh
+import queue
+import numpy as np
 
 # Warp
 import warp as wp
 
 # Custom code
-from pygarment.meshgen.render.pythonrender import render_images, render_frame_to_array
+from pygarment.meshgen.render.pythonrender import (
+    render_images, render_frame_to_array, FrameRenderer)
 from pygarment.meshgen.garment import Cloth
 from pygarment.meshgen.sim_config import SimConfig, PathCofig
 
@@ -150,8 +153,77 @@ def _run_frame_with_timeout(garment, frame_timeout, frame_num):
     with _FrameWatchdog(frame_timeout, garment, frame_num):
         garment.run_frame()
 
+class _VideoRecorder:
+    """Renders simulation video frames on a background thread.
+
+    The sim frame loop is GPU-bound while pyrender/EGL is CPU+GL-bound, so
+    rendering inline stalls the solver for every captured frame. Here the loop
+    only hands over a copy of the cloth vertices (cheap) and a worker thread
+    renders it, so video capture overlaps the sim instead of extending it.
+
+    The GL context is created inside the worker and never touched from
+    outside it. Rendering failures are swallowed: the video is a diagnostic,
+    and it must never take the simulation down with it.
+    """
+
+    def __init__(self, body_v, body_f, faces, render_props, resolution=None,
+                 queue_max=64):
+        self.faces = faces
+        self.body_v = body_v
+        self.body_f = body_f
+        self.render_props = render_props
+        self.resolution = resolution
+        self.frames = []
+        self.error = None
+        self._q = queue.Queue(maxsize=queue_max)
+        self._thread = threading.Thread(target=self._run, name='VideoRecorder',
+                                        daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        renderer = None
+        try:
+            while True:
+                item = self._q.get()
+                if item is None:
+                    break
+                if renderer is None:
+                    renderer = FrameRenderer(self.body_v, self.body_f,
+                                             self.render_props, self.resolution)
+                self.frames.append(renderer.render(item, self.faces))
+        except BaseException as e:
+            self.error = f'{type(e).__name__}: {e}'
+        finally:
+            if renderer is not None:
+                try:
+                    renderer.close()
+                except BaseException:
+                    pass
+
+    def submit(self, verts):
+        """Hand a frame to the worker. Copy: the caller reuses its buffer."""
+        if self.error is not None:
+            return
+        try:
+            self._q.put(np.array(verts, copy=True), timeout=30)
+        except queue.Full:
+            pass  # renderer fell too far behind; drop the frame, keep simulating
+
+    def finish(self, hold_frames=0):
+        """Drain the queue, stop the worker, and return the rendered frames."""
+        self._q.put(None)
+        self._thread.join()
+        if self.error is not None:
+            print(f'Simulation video frames skipped ({self.error})')
+            return []
+        if self.frames and hold_frames:
+            self.frames.extend([self.frames[-1]] * hold_frames)
+        return self.frames
+
+
 def sim_frame_sequence(garment, config, store_usd=False, verbose=False,
-                       video_frames=None, render_props=None, frame_interval=10):
+                       video_frames=None, render_props=None, frame_interval=10,
+                       recorder=None):
     """Run simulation frame loop.
 
     Args:
@@ -201,8 +273,11 @@ def sim_frame_sequence(garment, config, store_usd=False, verbose=False,
             num_cloth_cloth_contacts = garment.count_self_intersections()
             print(f'\nSelf-Intersection: {num_cloth_cloth_contacts}')
 
-        # Capture video frame
-        if video_frames is not None and frame % frame_interval == 0:
+        # Capture video frame. With a recorder the render happens on a worker
+        # thread, so this costs only a vertex readback + copy.
+        if recorder is not None and frame % frame_interval == 0:
+            recorder.submit(garment.current_verts)
+        elif video_frames is not None and frame % frame_interval == 0:
             video_frames.append(render_frame_to_array(
                 garment.current_verts, garment.f_cloth,
                 garment.v_body, garment.f_body,
@@ -296,7 +371,22 @@ def run_sim(
     config = SimConfig(sim_props['config'])   # Why separate class at all?
     garment = Cloth(cloth_name, config, paths, caching=store_usd)
 
+    # Video capture: interval and resolution are independent of the final
+    # still renders -- a 400x400 preview every 15th frame is a perfectly good
+    # diagnostic and a fraction of the cost of 800x800 every 10th.
+    video_frame_interval = int(sim_props['config'].get(
+        'video_frame_interval', video_frame_interval))
+    video_resolution = sim_props['config'].get('video_resolution')
+    recorder = None
     video_frames = [] if save_sim_video else None
+    if save_sim_video:
+        try:
+            recorder = _VideoRecorder(
+                garment.v_body, garment.f_body, garment.f_cloth,
+                render_props['config'], resolution=video_resolution)
+        except BaseException as e:
+            print(f'Video recorder unavailable, rendering inline ({e})')
+            recorder = None
 
     try:
         sim_frame_sequence(
@@ -304,6 +394,7 @@ def run_sim(
             video_frames=video_frames,
             render_props=render_props['config'] if save_sim_video else None,
             frame_interval=video_frame_interval,
+            recorder=recorder,
         )
 
     except FrameTimeOutError:
@@ -385,7 +476,11 @@ def run_sim(
     #print(f"Rendering {cloth_name} took {render_image_time}s")
 
     # Save simulation video
-    if video_frames:
+    if recorder is not None:
+        # One last frame of the settled state, then a ~1s hold on it.
+        recorder.submit(garment.current_verts)
+        video_frames = recorder.finish(hold_frames=video_fps - 1)
+    elif video_frames:
         # Capture final settled state as extra frames for a brief pause at the end
         final_frame = render_frame_to_array(
             garment.current_verts, garment.f_cloth,
@@ -395,6 +490,7 @@ def run_sim(
         for _ in range(video_fps):  # ~1 second hold on final frame
             video_frames.append(final_frame)
 
+    if video_frames:
         video_path = paths.out_el / f'{paths.sim_tag}_simulation.mp4'
         save_video(video_frames, video_path, fps=video_fps)
 
