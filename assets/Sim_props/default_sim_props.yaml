@@ -1,15 +1,21 @@
 sim:
   config:
     optimize_storage: true
+    # Integration step: dt = (1/sim_fps)/sim_substeps = 1/600, the same
+    # value the historic 60/10 gave. These two must always move together --
+    # halving sim_fps alone enlarges dt and the sim never settles -- and
+    # anything counted in *frames* below has to be rescaled with them.
+    sim_fps: 30
+    sim_substeps: 20
     max_sim_steps: 2500
     max_frame_time: 15
     max_meshgen_time: 60
     max_sim_time: 600
-    static_threshold: 0.03
+    static_threshold: 0.06        # per-frame bound, rescaled for sim_fps 30
     non_static_percent: 1.0
     max_body_collisions: 1000
     max_self_collisions: 5000
-    zero_gravity_steps: 150
+    zero_gravity_steps: 75        # counted in frames, rescaled for sim_fps 30
     resolution_scale: 1.0
     ground: true
     material:
