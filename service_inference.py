@@ -33,6 +33,7 @@ import json
 import multiprocessing
 import os
 import queue
+import signal
 import threading
 import time
 import traceback
@@ -156,7 +157,14 @@ KEY_TO_JOB: Dict[str, str] = {}  # dedup key -> most recent job id for that work
 JOBS_LOCK = threading.Lock()
 JOB_QUEUE: 'queue.Queue[Optional[str]]' = queue.Queue()
 STOP_EVENT = threading.Event()
-ACTIVE_PROCESS: dict = {'proc': None, 'job_id': None}
+# job_id -> Process, for the jobs currently simulating (up to max_concurrent).
+ACTIVE_PROCESSES: Dict[str, object] = {}
+ACTIVE_LOCK = threading.Lock()
+# Pre-warmed spare workers, each {'proc', 'conn'}: already imported and
+# Warp-initialised, blocked on a pipe. Topped up while jobs run, so the
+# import + CUDA-init cost is paid off the critical path.
+WARM_WORKERS: List[dict] = []
+WARM_LOCK = threading.Lock()
 SERVER_CONFIG = {
     'gpu': '0',
     # Root under which patterns live as {product_id}/{size}/ folders.
@@ -168,6 +176,14 @@ SERVER_CONFIG = {
     # make_pose_sequence.py.
     'smpl_models_dir': '../swan-comfyui/Muse/models/smpl',
     'smpl_poses_dir': '../swan-comfyui/Muse/poses_smpl',
+    # Keep spare workers pre-imported and Warp-initialized.
+    'prewarm': True,
+    # Simulations to run at once. The GPU is saturated only in bursts and a
+    # single sim uses ~2.4GB of VRAM, so a small amount of overlap raises
+    # throughput markedly; per-job latency rises with it.
+    'max_concurrent': 2,
+    # Worker processes for CGAL panel meshing inside each sim (0/1 = serial).
+    'panel_workers': 4,
 }
 
 
@@ -423,18 +439,86 @@ def _generate_smpl_body(base_path: Path, model_pkl: str, pose_file: str,
 
 
 def _sim_worker_entry(payload: dict):
-    """Child process entry point. Must stay a top-level function (spawn).
+    """Cold child process entry point. Must stay a top-level function (spawn)."""
+    # Must be set before importing run_custom_pants (it setdefault's GPU 1)
+    # and before Warp initializes.
+    os.environ['CUDA_VISIBLE_DEVICES'] = payload['gpu']
+    os.chdir(payload['repo_root'])
+    if payload.get('panel_workers'):
+        from pygarment.meshgen import boxmeshgen
+        boxmeshgen.init_panel_pool(payload['panel_workers'])
+    _run_payload(payload)
+
+
+def _warm_worker_entry(conn, gpu: str, repo_root: str, panel_workers: int = 0):
+    """Pre-warmed child: pays the import + Warp/CUDA init cost up front, then
+    blocks for a payload.
+
+    Those two together are ~2.4s of a fast job, all of it before any useful
+    work. Warming a spare while the *previous* job runs moves that off the
+    critical path without giving up the fresh-process-per-job isolation the
+    dispatcher relies on -- this process still handles exactly one job and
+    exits, so a poisoned Warp/CUDA context or a watchdog os._exit() cannot
+    leak into the next one.
+    """
+    os.environ['CUDA_VISIBLE_DEVICES'] = gpu
+    os.chdir(repo_root)
+    try:
+        # Panel-meshing pool first: it fork()s, and forking a process that
+        # already holds a CUDA context is a hazard. Doing it before the Warp
+        # import below keeps the children clean.
+        from pygarment.meshgen import boxmeshgen
+        boxmeshgen.init_panel_pool(panel_workers)
+
+        # Shutdown terminates idle spares, and this one spends its life
+        # blocked in conn.recv(). SIGTERM's default handler would take it out
+        # without running any cleanup, orphaning the panel pool's non-daemonic
+        # children onto init -- 4 processes leaked per spare, per restart.
+        # Installed before the slow imports below, which are just as
+        # interruptible. Restored to the default once a payload arrives: a
+        # SIGTERM mid-job must still reach the dispatcher as a non-zero
+        # exitcode, which is how it tells a shutdown from a finished run.
+        def _reap_pool_and_exit(signum, frame):
+            try:
+                boxmeshgen.shutdown_panel_pool()
+            finally:
+                os._exit(0)
+
+        signal.signal(signal.SIGTERM, _reap_pool_and_exit)
+        import run_custom_pants  # noqa: F401  -- triggers Warp init
+        from pygarment.meshgen import simulation  # noqa: F401  -- and pyrender/EGL
+        conn.send('ready')
+    except BaseException as e:
+        try:
+            conn.send(f'error: {type(e).__name__}: {e}')
+        except BaseException:
+            pass
+        return
+    payload = conn.recv()
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    if payload is None:
+        return
+    _run_payload(payload)
+
+
+def _run_payload(payload: dict):
+    """Run one simulation job in this process.
 
     Communicates the outcome via a JSON file in output_base rather than a
     pipe/queue: the sim's frame watchdog may os._exit() this process at any
     moment, and a file survives that where an unflushed pipe may not.
     """
-    # Must be set before importing run_custom_pants (it setdefault's GPU 1)
-    # and before Warp initializes.
-    os.environ['CUDA_VISIBLE_DEVICES'] = payload['gpu']
-    os.chdir(payload['repo_root'])
     output_base = Path(payload['output_base'])
     result = {'ok': False, 'sim_folder': None, 'error': None}
+    try:
+        # The panel-meshing pool's children are non-daemonic and outlive the
+        # job, which would keep this process alive forever and hang the
+        # dispatcher's join(). Tear it down before returning, whatever happens.
+        import atexit
+        from pygarment.meshgen import boxmeshgen as _bmg
+        atexit.register(_bmg.shutdown_panel_pool)
+    except Exception:
+        pass
     try:
         body_obj = Path(f"./assets/bodies/{payload['body_name']}.obj")
         if payload.get('generate_body') and not body_obj.is_file():
@@ -466,6 +550,11 @@ def _sim_worker_entry(payload: dict):
     try:
         with open(output_base / WORKER_RESULT_FILE, 'w') as f:
             json.dump(result, f)
+    except Exception:
+        pass
+    try:
+        from pygarment.meshgen import boxmeshgen as _bmg
+        _bmg.shutdown_panel_pool()
     except Exception:
         pass
 
@@ -543,6 +632,7 @@ def _resolve_outcome(job: Job, exitcode: Optional[int], ignore_dirs=()):
 
 def _dispatcher_loop():
     mp_ctx = multiprocessing.get_context('spawn')
+    _spawn_warm_worker(mp_ctx)
     while not STOP_EVENT.is_set():
         job_id = JOB_QUEUE.get()
         if job_id is None:
@@ -559,7 +649,75 @@ def _dispatcher_loop():
                     job.status = JobStatus.failed
                     job.error = job.error or 'Internal dispatcher error (see server log)'
                     job.finished_at = datetime.now().isoformat(timespec='seconds')
-            ACTIVE_PROCESS['proc'], ACTIVE_PROCESS['job_id'] = None, None
+            with ACTIVE_LOCK:
+                ACTIVE_PROCESSES.pop(job_id, None)
+
+
+def _spawn_warm_worker(mp_ctx, target=None):
+    """Top the spare pool up to `target` workers. Non-blocking: readiness is
+    checked when a spare is claimed."""
+    if not SERVER_CONFIG.get('prewarm', True):
+        return
+    if target is None:
+        target = SERVER_CONFIG['max_concurrent']
+    # Count and spawn under one lock: two dispatchers topping up at the same
+    # time would otherwise both see an empty pool and each fill it.
+    with WARM_LOCK:
+        WARM_WORKERS[:] = [w for w in WARM_WORKERS if w['proc'].is_alive()]
+        missing = max(0, target - len(WARM_WORKERS))
+        for _ in range(missing):
+            try:
+                parent, child = mp_ctx.Pipe()
+                proc = mp_ctx.Process(
+                    target=_warm_worker_entry,
+                    args=(child, SERVER_CONFIG['gpu'], str(REPO_ROOT),
+                          SERVER_CONFIG.get('panel_workers', 0)),
+                    # NOT daemonic: the worker forks its own panel-meshing
+                    # pool, and a daemonic process is forbidden children.
+                    # Shutdown terminates these in the lifespan handler.
+                    daemon=False,
+                )
+                proc.start()
+                child.close()
+                WARM_WORKERS.append({'proc': proc, 'conn': parent})
+            except Exception:
+                print(f'[prewarm] could not start spare worker:\n'
+                      f'{traceback.format_exc()}')
+                return
+
+
+def _claim_warm_worker(payload: dict, wait_s: float = 20.0):
+    """Hand the payload to a spare worker. Returns the process, or None if no
+    usable spare exists (the caller then falls back to a cold spawn)."""
+    while True:
+        with WARM_LOCK:
+            if not WARM_WORKERS:
+                return None
+            slot = WARM_WORKERS.pop(0)
+        proc, conn = slot['proc'], slot['conn']
+        if not proc.is_alive():
+            continue
+        try:
+            if not conn.poll(wait_s):        # still importing -- don't stall
+                raise TimeoutError('spare worker not ready')
+            msg = conn.recv()
+            if msg != 'ready':
+                raise RuntimeError(f'spare worker reported {msg!r}')
+            conn.send(payload)
+            return proc
+        except Exception as e:
+            print(f'[prewarm] discarding spare worker ({e})')
+            try:
+                if proc.is_alive():
+                    proc.terminate()
+            except Exception:
+                pass
+            return None
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def _run_job(mp_ctx, job_id):
@@ -576,15 +734,20 @@ def _run_job(mp_ctx, job_id):
         stale_dirs = {p.name for p in job.output_base.iterdir() if p.is_dir()}
         (job.output_base / WORKER_RESULT_FILE).unlink(missing_ok=True)
 
-        proc = mp_ctx.Process(
-            target=_sim_worker_entry,
-            args=({**job.payload, 'output_base': str(job.output_base)},),
-            daemon=True,
-        )
-        ACTIVE_PROCESS['proc'], ACTIVE_PROCESS['job_id'] = proc, job_id
-        proc.start()
+        payload = {**job.payload, 'output_base': str(job.output_base),
+                   'panel_workers': SERVER_CONFIG.get('panel_workers', 0)}
+        proc = _claim_warm_worker(payload)
+        if proc is None:
+            proc = mp_ctx.Process(
+                target=_sim_worker_entry, args=(payload,), daemon=False)
+            proc.start()
+        with ACTIVE_LOCK:
+            ACTIVE_PROCESSES[job_id] = proc
+        # Top the spare pool back up now, so it imports while this job simulates.
+        _spawn_warm_worker(mp_ctx)
         proc.join()
-        ACTIVE_PROCESS['proc'], ACTIVE_PROCESS['job_id'] = None, None
+        with ACTIVE_LOCK:
+            ACTIVE_PROCESSES.pop(job_id, None)
 
         with JOBS_LOCK:
             if STOP_EVENT.is_set() and proc.exitcode not in (0, 124):
@@ -624,16 +787,35 @@ def _run_job(mp_ctx, job_id):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    dispatcher = threading.Thread(target=_dispatcher_loop, daemon=True, name='sim-dispatcher')
-    dispatcher.start()
+    n = SERVER_CONFIG['max_concurrent']
+    dispatchers = [
+        threading.Thread(target=_dispatcher_loop, daemon=True,
+                         name=f'sim-dispatcher-{i}')
+        for i in range(n)
+    ]
+    for d in dispatchers:
+        d.start()
+    print(f'Dispatchers: {n} concurrent · prewarm='
+          f"{SERVER_CONFIG['prewarm']} · panel_workers="
+          f"{SERVER_CONFIG.get('panel_workers')}")
     yield
     STOP_EVENT.set()
-    JOB_QUEUE.put(None)
-    proc = ACTIVE_PROCESS['proc']
-    if proc is not None and proc.is_alive():
-        proc.terminate()
-        proc.join(5)
-    dispatcher.join(10)
+    with WARM_LOCK:
+        spares, WARM_WORKERS[:] = list(WARM_WORKERS), []
+    for w in spares:
+        if w['proc'].is_alive():
+            w['proc'].terminate()
+            w['proc'].join(5)
+    for _ in dispatchers:
+        JOB_QUEUE.put(None)
+    with ACTIVE_LOCK:
+        procs = list(ACTIVE_PROCESSES.values())
+    for proc in procs:
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(5)
+    for d in dispatchers:
+        d.join(10)
 
 
 app = FastAPI(title='GarmentCode draping inference server', lifespan=lifespan)
@@ -644,7 +826,11 @@ def health():
     return {
         'status': 'ok',
         'queue_depth': JOB_QUEUE.qsize(),
-        'running_job': ACTIVE_PROCESS['job_id'],
+        # running_job kept for compatibility with existing clients; it is the
+        # first of running_jobs now that several can run at once.
+        'running_job': next(iter(ACTIVE_PROCESSES), None),
+        'running_jobs': list(ACTIVE_PROCESSES),
+        'max_concurrent': SERVER_CONFIG['max_concurrent'],
     }
 
 
@@ -725,6 +911,14 @@ if __name__ == '__main__':
                         help='Directory with SMPL_FEMALE.pkl / SMPL_MALE.pkl')
     parser.add_argument('--smpl-poses-dir', default=SERVER_CONFIG['smpl_poses_dir'],
                         help='Directory with per-gender custom pose files ({gender}.txt)')
+    parser.add_argument('--no-prewarm', action='store_true',
+                        help='Do not keep pre-warmed spare sim workers')
+    parser.add_argument('--max-concurrent', type=int,
+                        default=SERVER_CONFIG['max_concurrent'],
+                        help='Simulations to run concurrently (default 2)')
+    parser.add_argument('--panel-workers', type=int,
+                        default=SERVER_CONFIG['panel_workers'],
+                        help='Processes for CGAL panel meshing per sim (0=serial)')
     parser.add_argument('--patterns-root', default=SERVER_CONFIG['patterns_root'],
                         help='Root folder holding patterns as {product_id}/{size}/')
     args = parser.parse_args()
@@ -733,6 +927,9 @@ if __name__ == '__main__':
     SERVER_CONFIG['smpl_models_dir'] = args.smpl_models_dir
     SERVER_CONFIG['smpl_poses_dir'] = args.smpl_poses_dir
     SERVER_CONFIG['patterns_root'] = args.patterns_root
+    SERVER_CONFIG['prewarm'] = not args.no_prewarm
+    SERVER_CONFIG['max_concurrent'] = max(1, args.max_concurrent)
+    SERVER_CONFIG['panel_workers'] = args.panel_workers
     os.chdir(REPO_ROOT)
     # No per-request access log: polling clients hit /jobs every second and
     # drown out the useful job-pipeline output.
