@@ -7,6 +7,8 @@ sim:
     # anything counted in *frames* below has to be rescaled with them.
     sim_fps: 30
     sim_substeps: 20
+    static_check_interval: 8
+    lazy_vert_fetch: true
     max_sim_steps: 2500
     max_frame_time: 15
     max_meshgen_time: 60
