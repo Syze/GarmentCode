@@ -118,6 +118,13 @@ class SimConfig:
         self.zero_gravity_steps = self.get_sim_props_value(sim_props, 'zero_gravity_steps', 5)
         self.resolution_scale = self.get_sim_props_value(sim_props, 'resolution_scale', 1.0)
         self.ground = self.get_sim_props_value(sim_props, 'ground', True)
+        # Solve cloth self-contacts every Nth substep instead of every one
+        # (1 = every substep, current behaviour). The contact PAIRS still come
+        # from collide() once per frame; only the XPBD solve for them is
+        # strided. Springs, bending and body contacts are unaffected.
+        # Requires the vendored Warp fork edit -- without it this is a no-op.
+        self.self_contact_interval = max(1, int(self.get_sim_props_value(
+            sim_props_option, 'self_contact_interval', 1)))
         # Perf: evaluate the static-equilibrium check every N frames instead of
         # every frame (the check needs a GPU->CPU vertex readback, which
         # serialises the sim pipeline). is_static() scales its threshold by the

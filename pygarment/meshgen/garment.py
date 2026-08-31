@@ -458,6 +458,9 @@ class Cloth:
 
         # ------- Finalize --------------
         self.model: wp.sim.Model = builder.finalize(device = self.device) #data is transferred to warp tensors, object used in simulation
+        # Read by the XPBD integrator to stride the self-contact solve; a Warp
+        # without that edit simply ignores the attribute.
+        self.model.self_contact_interval = getattr(config, 'self_contact_interval', 1)
 
     def _crotch_y_smpl_or(self, formula):
         """Body crotch Y: SMPL crotch landmark vertex 1210 (floor-relative) if

@@ -32,6 +32,9 @@ sim:
       fabric_thickness: 0.5
       fabric_friction: 0.4
     options:
+      # Solve cloth self-contacts every Nth substep (pairs still come from
+      # collide() once per frame). Needs the vendored Warp fork edit.
+      self_contact_interval: 4
       enable_particle_particle_collisions: true
       enable_triangle_particle_collisions: true
       enable_edge_edge_collisions: true
