@@ -18,7 +18,7 @@ sim:
     max_body_collisions: 1000
     max_self_collisions: 5000
     zero_gravity_steps: 75        # counted in frames, rescaled for sim_fps 30
-    resolution_scale: 1.0
+    resolution_scale: 1.15
     ground: true
     material:
       garment_tri_ka: 40000.0
