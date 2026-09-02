@@ -329,10 +329,6 @@ def sim_frame_sequence(garment, config, store_usd=False, verbose=False,
                 static = False
             else:
                 break
-        elif garment.pose_animation_finished(frame):
-            # Phases 2 and 3 are a fixed frame budget rather than a settle, so
-            # the run is simply over here.
-            break
 
         runtime = time.time() - start_time
         if runtime > config.max_sim_time:

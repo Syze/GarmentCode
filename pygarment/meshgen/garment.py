@@ -291,11 +291,11 @@ class Cloth:
         # METRES->cm to match body_vertices (which were scaled by b_scale).
         # The run has three phases: (1) drape on the loaded pose, dynamic --
         # it ends when is_static() fires, exactly as a run without animation;
-        # (2) the pose steps, a fixed gap * (len(seq) - 1) frames; (3) a fixed
-        # pose_animation_settle_frames, then the run ends. Phases 2 and 3 are a
-        # fixed budget, not a settle: gravity is on throughout the animation so
-        # the drape stays settled as the body moves, and the static check is
-        # suppressed across both (it would otherwise fire between pose steps).
+        # (2) the pose steps, a fixed gap * (len(seq) - 1) frames; (3) a settle
+        # of at least pose_animation_settle_frames, after which the normal
+        # static check ends the run. The check is suppressed across phase 2 and
+        # the phase 3 floor -- it would otherwise fire on a still frame between
+        # two pose steps, or before the cloth has reacted to the body stopping.
         # Phase 1 is only pinned to a frame number when
         # pose_animation_start_frame is an int rather than 'on_static'.
         self._pose_anim = bool(getattr(config, 'pose_animation_npy', None))
@@ -307,7 +307,7 @@ class Cloth:
             self._pose_body_base = np.asarray(body_vertices, dtype=np.float64)
             self._pose_delta = (seq - seq[0]).astype(np.float64) * self.b_scale
             self._pose_gap = max(1, int(config.pose_animation_frame_gap))
-            self._pose_settle = int(getattr(config, 'pose_animation_settle_frames', 50))
+            self._pose_settle = int(getattr(config, 'pose_animation_settle_frames', 25))
             self._pose_idx = 0
             start = getattr(config, 'pose_animation_start_frame', 'on_static')
             if isinstance(start, str):
@@ -315,11 +315,11 @@ class Cloth:
                 self._pose_pending = True
             else:
                 self._schedule_pose_animation(int(start))
-                # Fixed-start behaviour: the animation defines the whole budget.
-                # +1 so the last frame of phase 3 is actually simulated and the
-                # run ends via pose_animation_finished() rather than by hitting
-                # the cap, which is recorded as a static_equilibrium failure.
-                config.max_sim_steps = self._pose_end + self._pose_settle + 1
+                # Only a floor: phase 3 is dynamic, so max_sim_steps stays the
+                # config's own cap and the static check ends the run. Clamping
+                # it to the end of the animation would make every fixed-start
+                # run finish at the cap, which is recorded as a
+                # static_equilibrium failure.
                 config.min_sim_steps = max(
                     getattr(config, 'min_sim_steps', 0) or 0, self._pose_end + 1)
 
@@ -875,17 +875,6 @@ class Cloth:
     def pose_animation_holding(self, frame):
         """True while the run must not be ended by the static check."""
         return self._pose_anim and frame < self._pose_hold_until
-
-    def pose_animation_finished(self, frame):
-        """True once the pose steps and the settle after them are both done.
-
-        This is what ends an animated run: phases 2 and 3 are a fixed budget,
-        so there is nothing to wait for. Ending here rather than by running out
-        of max_sim_steps also keeps the frame == max_sim_steps - 1 test in
-        simulation.py meaning what it says -- a drape that never settled.
-        """
-        return (self._pose_anim and bool(self._pose_anim_frames)
-                and frame >= self._pose_hold_until)
 
     def _apply_pose_frame(self):
         """Advance the body one step along the pose-animation sequence and refit

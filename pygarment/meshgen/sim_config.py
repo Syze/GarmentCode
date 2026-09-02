@@ -169,12 +169,13 @@ class SimConfig:
         # which also clamps max_sim_steps to the end of the animation).
         self.pose_animation_start_frame = self.get_sim_props_value(sim_props, 'pose_animation_start_frame', 'on_static')
         self.pose_animation_frame_gap = self.get_sim_props_value(sim_props, 'pose_animation_frame_gap', 2)
-        # Frames simulated after the last pose step, after which the run ends.
-        # A fixed count, not a settle: gravity is on throughout the animation,
-        # so the drape stays settled as the body moves and there is nothing to
-        # wait for. The static check is suppressed across the animation and
-        # these frames, since it would otherwise fire between two pose steps.
-        self.pose_animation_settle_frames = self.get_sim_props_value(sim_props, 'pose_animation_settle_frames', 50)
+        # MINIMUM frames to hold after the last pose step. The static check is
+        # suppressed across the animation and these frames -- it would otherwise
+        # fire on a still frame between two pose steps, or on the first frame
+        # after the body stops while the cloth is still swinging. Past them the
+        # normal check resumes and ends the run when the drape is actually
+        # static, so this is a floor on phase 3, not its length.
+        self.pose_animation_settle_frames = self.get_sim_props_value(sim_props, 'pose_animation_settle_frames', 25)
         # Quality filter
         self.max_body_collisions = self.get_sim_props_value(sim_props, 'max_body_collisions', 0)
         self.max_self_collisions = self.get_sim_props_value(sim_props, 'max_self_collisions', 0)
