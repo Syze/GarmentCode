@@ -1169,39 +1169,32 @@ def map_production_to_design(prod, body_yaml_path, elastic_waistband=False,
     return design
 
 
-def _body_leg_x_centers(body_obj_path, y_lo, y_hi, lateral_min=0.5):
-    """Return (left_x, right_x) in cm for the body in the world Y band [y_lo, y_hi].
+SMPL_VERT_COUNT = 6890              # SMPL topology check
+SMPL_LEG_TOP_VERTS = (907, 4393)    # mid-thigh, front
+SMPL_LEG_BOT_VERTS = (3322, 6723)   # low shin above the ankle, front
 
-    Body OBJ is in metres; values are converted to cm. Vertices are split by X
-    sign (left X > +lateral_min, right X < -lateral_min) and means returned.
+
+def _body_leg_x_landmarks(body_obj_path):
+    """((top_L, top_R), (bot_L, bot_R)) leg-axis X in cm, or None if not SMPL.
+
+    Only X is read, so the body's Y normalization is irrelevant here; the body
+    OBJ is in metres and values are returned in cm.
     """
-    xs, ys = [], []
-    with open(body_obj_path) as f:
+    xs = []
+    with open(body_obj_path, errors='replace') as f:
         for line in f:
             if line.startswith('v '):
-                p = line.split()
-                xs.append(float(p[1])); ys.append(float(p[2]))
-    if not xs:
-        return None, None
-    xs_cm = [x * 100.0 for x in xs]
-    ys_cm = [y * 100.0 for y in ys]
-    left_xs  = [x for x, y in zip(xs_cm, ys_cm) if y_lo <= y <= y_hi and x >  lateral_min]
-    right_xs = [x for x, y in zip(xs_cm, ys_cm) if y_lo <= y <= y_hi and x < -lateral_min]
-    if not left_xs or not right_xs:
-        return None, None
-    return sum(left_xs) / len(left_xs), sum(right_xs) / len(right_xs)
+                xs.append(float(line.split()[1]))
+    if len(xs) != SMPL_VERT_COUNT:
+        return None
+    return (tuple(xs[i] * 100.0 for i in SMPL_LEG_TOP_VERTS),
+            tuple(xs[i] * 100.0 for i in SMPL_LEG_BOT_VERTS))
 
 
 def _apply_pose_x_rotation(folder, body_obj_path,
-                           top_band_height=15.0,
-                           top_band_offset_below_crotch=15.0,
-                           bot_band_height=20.0,
-                           bot_band_floor=0.0,
                            min_angle_deg=0.5,
                            back_rise_lift=0.0,
-                           extra_x_sep=0.0,
-                           foot_guard=8.0,
-                           cuff_align=False):
+                           extra_x_sep=0.0):
     """Per-leg translation + Z rotation to align pant legs with diagonally
     asymmetric body legs (HM-style A-pose bodies). Each leg's two panels (front
     + back) translate and rotate as a rigid pair around their shared top-center
@@ -1240,26 +1233,16 @@ def _apply_pose_x_rotation(folder, body_obj_path,
     leg_bot_y = min(panel_y_min.values())
     leg_length = leg_top_y - leg_bot_y
 
-    top_band = (leg_top_y - top_band_offset_below_crotch - top_band_height,
-                leg_top_y - top_band_offset_below_crotch)
-    # Sample the body at a fixed floor-relative SHIN band, NOT tracking the
-    # garment hem. When a garment is too long for a short body, its hem drops
-    # below the floor, which used to push this band down onto the FEET -- and
-    # this A-pose body's feet splay ~8-9cm outboard of the shin, so the leg got
-    # aimed at the splayed foot and (especially for skinny cuts) wrapped outside
-    # the body leg. A fixed shin band tracks the actual lower leg for every
-    # body/garment, so theta aims the leg at the leg, not the foot.
-    bot_band = (bot_band_floor, bot_band_floor + bot_band_height)
-
-    body_top_L, body_top_R = _body_leg_x_centers(body_obj_path, *top_band)
-    body_bot_L, body_bot_R = _body_leg_x_centers(body_obj_path, *bot_band)
-    if any(v is None for v in (body_top_L, body_top_R, body_bot_L, body_bot_R)):
-        print(f'  Pose-X-Rot skipped (no body leg samples; top band={top_band}, bot band={bot_band})')
+    # Leg axis straight off pinned SMPL vertices -- no Y bands, no X sign split.
+    _lm = _body_leg_x_landmarks(body_obj_path)
+    if _lm is None:
+        print(f'  Pose-X-Rot skipped (body is not SMPL topology: {body_obj_path})')
         return
+    (body_top_L, body_top_R), (body_bot_L, body_bot_R) = _lm
 
     # print(f'  Pose-X-Rot: leg_top_y={leg_top_y:.2f} leg_bot_y={leg_bot_y:.2f} leg_len={leg_length:.2f}')
-    # print(f'    body top band Y=[{top_band[0]:.2f}, {top_band[1]:.2f}]  L={body_top_L:+.2f} R={body_top_R:+.2f}')
-    # print(f'    body bot band Y=[{bot_band[0]:.2f}, {bot_band[1]:.2f}]  L={body_bot_L:+.2f} R={body_bot_R:+.2f}')
+    # print(f'    body thigh (v{SMPL_LEG_TOP_VERTS}) L={body_top_L:+.2f} R={body_top_R:+.2f}')
+    # print(f'    body ankle (v{SMPL_LEG_BOT_VERTS}) L={body_bot_L:+.2f} R={body_bot_R:+.2f}')
 
     def pivot_x_for_leg(panel_names):
         # Average X over the panel's full top (waist) edge. The back-rise scoop
@@ -1288,6 +1271,14 @@ def _apply_pose_x_rotation(folder, body_obj_path,
     pivot_R_x = pivot_x_for_leg(['pant_f_r', 'pant_b_r'])
     pivot_y = leg_top_y
 
+    # Shift and rotation are ONE correction and only work as a pair: the shift
+    # puts each leg's waist pivot on the body's thigh X, then rotating by theta
+    # about that pivot swings the hem -- leg_length below it -- sideways by
+    # exactly leg_length * tan(theta) = body_bot - body_top, landing it on the
+    # body's ankle X. Applying the rotation alone leaves the pivot at the
+    # pattern's own X and throws the hem outboard instead (measured on this
+    # body/size: hem 29.73 against an ankle at 24.47, worse than no pose-X at
+    # all). Both numbers come from the pinned SMPL landmarks.
     shift_L = body_top_L - pivot_L_x
     shift_R = body_top_R - pivot_R_x
     theta_L = math.atan2(body_bot_L - body_top_L, leg_length)
@@ -1360,77 +1351,6 @@ def _apply_pose_x_rotation(folder, body_obj_path,
         apply_rigid(panels[n], shift_L, theta_L, pivot_L_x)
     for n in right_grp:
         apply_rigid(panels[n], shift_R, theta_R, pivot_R_x)
-
-    # --- cuffs get their OWN alignment ------------------------------------
-    # The leg above is one rigid transform aimed from a thigh band to a shin
-    # band, so it can only be right on average: a single rotation cannot follow
-    # a leg that changes direction down its length. At the ankle -- the far end
-    # from the pivot -- the residual is the largest, and that is exactly where
-    # the cuffs sit. So each cuff group is re-placed against the body in ITS OWN
-    # y band, with a tilt measured locally across that band rather than the
-    # leg's average. The cuff's top stays the pivot, since that is the edge
-    # welded to the leg hem.
-    def _rigid_about(panel, shift_x, dtheta, piv_x, piv_y):
-        rot_piv_x = piv_x + shift_x
-        tx, ty, tz = panel['translation']
-        tx += shift_x
-        dx, dy = tx - rot_piv_x, ty - piv_y
-        c, s = math.cos(dtheta), math.sin(dtheta)
-        panel['translation'] = [rot_piv_x + dx * c - dy * s,
-                                piv_y + dx * s + dy * c, tz]
-        rx, ry, rz = panel['rotation']
-        panel['rotation'] = [rx, ry, rz + math.degrees(dtheta)]
-
-    def _world_xy(panel):
-        ang = math.radians(panel['rotation'][2])
-        c, s = math.cos(ang), math.sin(ang)
-        tx, ty = panel['translation'][0], panel['translation'][1]
-        return [(tx + v[0] * c - v[1] * s, ty + v[0] * s + v[1] * c)
-                for v in panel['vertices']]
-
-    for side in ('l', 'r') if cuff_align else ():
-        grp = [n for n in panels if f'{side}_cuff' in n]
-        if not grp:
-            continue
-        pts = [q for n in grp for q in _world_xy(panels[n])]
-        y_hi, y_lo = max(q[1] for q in pts), min(q[1] for q in pts)
-        top_xs = [q[0] for q in pts if q[1] >= y_hi - 0.5]
-        piv_x, piv_y = sum(top_xs) / len(top_xs), y_hi
-        # Sampling has to stay ABOVE the feet. On this A-pose body the left foot
-        # splays hard: the leg centre reads +25.83 in y=[0,5] against +18.77 in
-        # y=[5,10], a 7 cm jump, and above y~10 the profile is smooth and nearly
-        # linear. Taking the band below the cuff (pure foot) gave a 25.9 deg tilt
-        # and a 9.9 cm shift -- the same trap the leg's fixed shin band exists to
-        # avoid. So the target and the tilt are both read from bands above
-        # `foot_guard`, and extrapolated down to the cuff.
-        i = 0 if side == 'l' else 1
-        lo_s = max(y_lo, foot_guard)
-        hi_s = max(y_hi, lo_s + 4.0)
-        here = _body_leg_x_centers(body_obj_path, lo_s, hi_s)
-        if here[0] is None:
-            print(f'  Cuff-align {side}: skipped (no body samples in '
-                  f'[{lo_s:.1f}, {hi_s:.1f}])')
-            continue
-        target = here[i]
-        span = max(6.0, y_hi - y_lo)
-        lower = _body_leg_x_centers(body_obj_path, lo_s, lo_s + span)
-        upper = _body_leg_x_centers(body_obj_path, lo_s + span, lo_s + 2 * span)
-        theta = 0.0
-        if lower[0] is not None and upper[0] is not None:
-            theta = math.atan2(lower[i] - upper[i], span)
-        # ROTATION ONLY, about the cuff's own top edge. Re-centring it on the
-        # body's leg centre as well was wrong: in the flat layout the front and
-        # back cuffs straddle the leg at z = +/-, so neither one's x centre is
-        # meant to sit on the body's axis -- asking for that gave a 12.3 cm shift
-        # on the left and took self-intersections from 22 to 91. The top edge is
-        # welded to the leg hem, so keeping it put and only re-aiming the cuff
-        # down the body's LOCAL leg direction is the correction that was missing.
-        cur = math.radians(panels[grp[0]]['rotation'][2])
-        print(f'  Cuff-align {side}: band y=[{y_lo:.1f},{y_hi:.1f}] '
-              f'body x {target:+.2f} (cuff {piv_x:+.2f}), '
-              f'tilt {math.degrees(cur):+.2f}->{math.degrees(theta):+.2f} deg')
-        for n in grp:
-            _rigid_about(panels[n], 0.0, theta - cur, piv_x, piv_y)
 
     with open(spec_path, 'w') as f:
         json.dump(spec, f, indent=2)
@@ -1658,20 +1578,13 @@ def _place_pattern_for_body(spec_file, body_name, output_base, placement):
     print(f'  Placement: crotch lift {lift:.2f} for body {body_name} '
           f'-> {placed_folder}')
 
+    # Aligns each pant leg to the body leg: X shift onto the thigh, Z rotation
+    # onto the ankle, both read from pinned SMPL vertices.
     if body_obj.exists():
-        _kw = {}
-        # A garment may raise the lower sampling band off the floor. Needed when
-        # the body's feet splay: on the bonprix custom pose the left leg centre
-        # reads +23.39 over the default y=[0,20] band but +17.26 over y=[8,20],
-        # so the leg gets aimed 6 cm outboard -- past the ankle, at the foot --
-        # and the ankle rib lands 4.5 cm beside the ankle instead of round it.
-        for k in ('bot_band_floor', 'bot_band_height'):
-            if placement.get(k) is not None:
-                _kw[k] = float(placement[k])
         _apply_pose_x_rotation(
             placed_folder, body_obj,
             back_rise_lift=float(placement.get('back_rise_lift', 0.0) or 0.0),
-            extra_x_sep=float(placement.get('extra_x_sep', 0.0) or 0.0), **_kw)
+            extra_x_sep=float(placement.get('extra_x_sep', 0.0) or 0.0))
     else:
         print(f'  Pose-X skipped (no body OBJ at {body_obj})')
     return placed_folder
