@@ -4346,13 +4346,6 @@ def generate_pattern(size, config, body_yaml_path, output_base,
             'back_rise_lift': 0.0,   # the DXF's own back rise; no extra scoop
             'extra_x_sep': 0.1,      # small gap so the two crotch tips do not
                                      # start coincident
-            # Aim the legs at the ANKLE, not the foot. The default lower band
-            # (y=0..20) includes the splayed feet: on this body the left leg
-            # centre reads +23.39 there against +17.4 at the ankle, so the leg
-            # was aimed 6 cm outboard and the rib finished 4.5 cm beside the
-            # ankle instead of wrapping it.
-            'bot_band_floor': 8.0,
-            'bot_band_height': 12.0,
         }
         with open(spec_path, 'w') as f:
             json.dump(spec, f, indent=2)
