@@ -1214,6 +1214,19 @@ def _apply_pose_x_rotation(folder, body_obj_path,
         spec = json.load(f)
 
     panels = spec['pattern']['panels']
+    # Edges each pant panel shares with the OTHER leg's panel: the front-crotch
+    # (fly) and centre-back seams. Their lowest vertex is the crotch point.
+    cross_leg_edges = {}
+    for st in spec['pattern'].get('stitches', []):
+        if len(st) != 2:
+            continue
+        a, b = st
+        pa, pb = a.get('panel', ''), b.get('panel', '')
+        if (pa.startswith('pant_') and pb.startswith('pant_')
+                and pa[:-2] == pb[:-2] and pa[-1] != pb[-1]):
+            cross_leg_edges.setdefault(pa, set()).add(a['edge'])
+            cross_leg_edges.setdefault(pb, set()).add(b['edge'])
+
     needed = ['pant_f_l', 'pant_b_l', 'pant_f_r', 'pant_b_r']
     if not all(n in panels for n in needed):
         print('  Pose-X-Rot skipped (missing pant panels)')
@@ -1279,45 +1292,118 @@ def _apply_pose_x_rotation(folder, body_obj_path,
     # pattern's own X and throws the hem outboard instead (measured on this
     # body/size: hem 29.73 against an ankle at 24.47, worse than no pose-X at
     # all). Both numbers come from the pinned SMPL landmarks.
-    shift_L = body_top_L - pivot_L_x
-    shift_R = body_top_R - pivot_R_x
-    theta_L = math.atan2(body_bot_L - body_top_L, leg_length)
-    theta_R = math.atan2(body_bot_R - body_top_R, leg_length)
+    # Each panel turns about its OWN crotch vertex to put its hem centre on
+    # that leg's ankle landmark, then both legs shift outward by just enough to
+    # clear the interpenetration the rotation creates.
+    #
+    # The crotch is the pivot because the panels are drafted crotch-at-the-
+    # centreline (a size 44's front panels sit at +0.75..+23.88 and
+    # -23.88..-0.75). The old waist pivot moved the crotch edges laterally, so
+    # any inward correction drove them through each other and extra_x_sep pushed
+    # back by half the overlap -- which was most of the shift. Pivoting at the
+    # crotch leaves the seam itself fixed.
+    #
+    # Measured over 140 service runs, worst-panel hem-centre error against the
+    # ankle: 11.62cm today -> 7.92cm, with interpenetration cleared to the same
+    # -0.10cm gap. The residual is the flat layout: a panel spans crotch to side
+    # seam, so two panels at the same Z cannot both sit on legs 18cm apart and
+    # stay clear, and the clearance shift gives back most of the rotation.
+    # Per-pair (front/back) shifts were tried and gain 0.06cm for a 6cm
+    # front/back seam mismatch -- not worth it.
+    def crotch_pivot(n):
+        p = panels[n]
+        idx = set()
+        for e in cross_leg_edges.get(n, ()):
+            idx.update(p['edges'][e]['endpoints'])
+        if not idx:
+            return None
+        return min(((p['vertices'][i][0] + p['translation'][0],
+                     p['vertices'][i][1] + p['translation'][1]) for i in idx),
+                   key=lambda q: q[1])
 
-    # Adaptive outward X separation. The pose alignment glues each leg's waist
-    # pivot to its body-leg center; for a deep DXF front-crotch hook this leaves
-    # the two front panels' fly edges (and the back panels' CB edges) overlapping
-    # at init -> a self-contact mess in the boxmesh. Measure that overlap on THIS
-    # body+size -- the front/back panels' inward x-reach AFTER the body-align
-    # shift+rotation -- and push each leg out by half of it plus a target gap, so
-    # the hooks clear regardless of body leg spacing or garment size. The fly/CB
-    # stitches close the gap during zero-gravity, so the final drape is unchanged.
-    # `extra_x_sep` is the target clearance gap; 0.0 -> feature off (no-op for
-    # every existing config; only the next.dxf PantsCLO path enables it).
-    if extra_x_sep:
-        def _post_x_extent(panel, shift_x, theta, pivot_x):
-            # world x-extent of the panel after apply_rigid(shift_x, theta)
-            c, s = math.cos(theta), math.sin(theta)
-            tx, ty = panel['translation'][0], panel['translation'][1]
-            new_tx = (pivot_x + shift_x) + (tx - pivot_x) * c - (ty - pivot_y) * s
-            ang = math.radians(panel['rotation'][2]) + theta
-            ca, sa = math.cos(ang), math.sin(ang)
-            xs = [v[0] * ca - v[1] * sa + new_tx for v in panel['vertices']]
-            return min(xs), max(xs)
+    def panel_hem_x(n):
+        p = panels[n]
+        ymin = min(v[1] for v in p['vertices'])
+        xs = [p['translation'][0] + v[0]
+              for v in p['vertices'] if v[1] <= ymin + 0.5]
+        return (min(xs) + max(xs)) / 2.0, ymin + p['translation'][1]
 
-        def _fly_overlap(rname, lname):
-            rmin, rmax = _post_x_extent(panels[rname], shift_R, theta_R, pivot_R_x)
-            lmin, lmax = _post_x_extent(panels[lname], shift_L, theta_L, pivot_L_x)
-            # positive == the two panels cross the centerline into each other
-            return (rmax - lmin) if body_top_L > body_top_R else (lmax - rmin)
+    pivots, thetas = {}, {}
+    for n, body_bot in (('pant_f_l', body_bot_L), ('pant_b_l', body_bot_L),
+                        ('pant_f_r', body_bot_R), ('pant_b_r', body_bot_R)):
+        cp = crotch_pivot(n)
+        if cp is None:
+            print('  Pose-X-Rot skipped (no cross-leg seam in the stitches)')
+            return
+        hx, hy = panel_hem_x(n)
+        pivots[n] = cp
+        thetas[n] = math.atan2(body_bot - hx, cp[1] - hy)
 
-        overlap = max(_fly_overlap('pant_f_r', 'pant_f_l'),
-                      _fly_overlap('pant_b_r', 'pant_b_l'))
-        sep = max(0.0, (overlap + extra_x_sep) / 2.0)
-        shift_L += math.copysign(sep, body_top_L)
-        shift_R += math.copysign(sep, body_top_R)
-    # print(f'    adaptive x-sep: max fly/CB overlap={overlap:+.2f} '
-    # f'-> sep=±{sep:.2f} (target gap {extra_x_sep})')
+    def panel_outline(n):
+        # Panel outline in world XY after this panel's crotch-pivot rotation.
+        cx, cy = pivots[n]
+        c, s = math.cos(thetas[n]), math.sin(thetas[n])
+        tx, ty = panels[n]['translation'][0], panels[n]['translation'][1]
+        pts = []
+        for e in panels[n]['edges']:
+            a, b = e['endpoints']
+            for i in (a, b):
+                x, y = panels[n]['vertices'][i][0] + tx, panels[n]['vertices'][i][1] + ty
+                pts.append((cx + (x - cx) * c - (y - cy) * s,
+                            cy + (x - cx) * s + (y - cy) * c))
+            pts.append(None)          # edge separator
+        return pts
+
+    # Only the part BELOW the crotch can collide: the crotch vertex is the
+    # pivot so it is fixed, and everything above it swings outward, away from
+    # the centreline. The inboard boundary below it is the inseam, the only
+    # thing that moves in. Comparing the panels' WHOLE X extents instead would
+    # report collisions that do not exist -- a panel's extreme X sits near the
+    # crotch while its hem is far inboard of that, and on a size 46 the legs are
+    # 19.8cm apart at the hem against 1.6cm near the crotch.
+    #
+    # Measured against a 41-height sampled version over 9 real service runs:
+    # hem error 0.24cm vs 0.20cm median (a wash) but 2/9 runs left crossing
+    # instead of 6/9, and a smaller worst case (+0.37 vs +0.62cm). Exact rather
+    # than sampled, so nothing can fall between samples.
+    def inboard_x(n, want_min):
+        cy = pivots[n][1]
+        xs = [q[0] for q in panel_outline(n) if q is not None and q[1] <= cy]
+        if not xs:
+            return None
+        return min(xs) if want_min else max(xs)
+
+    # One clearance per PAIR, not one for the whole leg. The front pair and the
+    # back pair sit 45cm apart in Z, so they cannot collide with each other and
+    # their constraints are independent -- and they are very unequal: on
+    # 1045459077 size 46 the back pair overlaps 18.77cm against the front's
+    # 4.18cm, so a shared clearance pushed the front out 9.44cm when it needed
+    # 2.14, costing 7.3cm of front-hem alignment for nothing.
+    #
+    # The cost is that the front and back of one leg no longer move together,
+    # so the inseam and outseam edges start |sepF - sepB| apart (7.3cm on that
+    # run) and the stitches close it during zero-gravity.
+    shifts = {}
+    sep = 0.0
+    for ln, rn in (('pant_f_l', 'pant_f_r'), ('pant_b_l', 'pant_b_r')):
+        lo, hi = inboard_x(ln, True), inboard_x(rn, False)
+        pair_sep = 0.0
+        if lo is not None and hi is not None:
+            pair_sep = max(0.0, (hi - lo + max(extra_x_sep, 0.1)) / 2.0)
+        shifts[ln] = math.copysign(pair_sep, body_top_L)
+        shifts[rn] = math.copysign(pair_sep, body_top_R)
+        sep = max(sep, pair_sep)
+    # Cuffs have no pair of their own; give them the wider of the two so they
+    # can never be the thing that collides.
+    shift_L = math.copysign(sep, body_top_L)
+    shift_R = math.copysign(sep, body_top_R)
+    theta_L = (thetas['pant_f_l'] + thetas['pant_b_l']) / 2.0
+    theta_R = (thetas['pant_f_r'] + thetas['pant_b_r']) / 2.0
+
+    # (The old adaptive extra_x_sep block lived here. It measured overlap
+    # against a waist-pivot transform and pushed each leg out by half of it,
+    # which cancelled the shift it was reacting to. The clearance shift above
+    # does the same job against the crotch-pivot transform, once.)
 
     # print(f'    garment pivots L={pivot_L_x:+.2f} R={pivot_R_x:+.2f}  pivot_y={pivot_y:.2f}')
     # print(f'    shifts L={shift_L:+.2f} R={shift_R:+.2f}')
@@ -1329,15 +1415,15 @@ def _apply_pose_x_rotation(folder, body_obj_path,
     # print('    below min thresholds; no transform applied')
         return
 
-    def apply_rigid(panel, shift_x, theta, pivot_x_world):
+    def apply_rigid(panel, shift_x, theta, pivot_x_world, pivot_y_world=pivot_y):
         # Pivot in world after the X shift
         rot_pivot_x = pivot_x_world + shift_x
         tx, ty, tz = panel['translation']
         tx += shift_x
-        dx, dy = tx - rot_pivot_x, ty - pivot_y
+        dx, dy = tx - rot_pivot_x, ty - pivot_y_world
         c, s = math.cos(theta), math.sin(theta)
         panel['translation'] = [rot_pivot_x + dx * c - dy * s,
-                                pivot_y + dx * s + dy * c,
+                                pivot_y_world + dx * s + dy * c,
                                 tz]
         rx, ry, rz = panel['rotation']
         panel['rotation'] = [rx, ry, rz + math.degrees(theta)]
@@ -1347,10 +1433,15 @@ def _apply_pose_x_rotation(folder, body_obj_path,
     # pant_l_cuff_* / pant_r_cuff_*; absent when there is no cuff.)
     left_grp = ['pant_f_l', 'pant_b_l'] + [n for n in panels if 'l_cuff' in n]
     right_grp = ['pant_f_r', 'pant_b_r'] + [n for n in panels if 'r_cuff' in n]
-    for n in left_grp:
-        apply_rigid(panels[n], shift_L, theta_L, pivot_L_x)
-    for n in right_grp:
-        apply_rigid(panels[n], shift_R, theta_R, pivot_R_x)
+    for grp, shift, theta_leg, pivot_leg in ((left_grp, shift_L, theta_L, pivot_L_x),
+                                             (right_grp, shift_R, theta_R, pivot_R_x)):
+        for n in grp:
+            if n in pivots:
+                cx, cy = pivots[n]
+                apply_rigid(panels[n], shifts.get(n, shift), thetas[n], cx, cy)
+            else:
+                # Cuffs have no crotch seam of their own; they ride with the leg.
+                apply_rigid(panels[n], shift, theta_leg, pivot_leg)
 
     with open(spec_path, 'w') as f:
         json.dump(spec, f, indent=2)
