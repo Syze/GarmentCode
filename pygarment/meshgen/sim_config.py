@@ -162,12 +162,19 @@ class SimConfig:
         # tracks the moving body — e.g. drape on A-pose, animate to a target pose
         # so sleeves wrap with room and then follow the arms down. None = off.
         self.pose_animation_npy = self.get_sim_props_value(sim_props, 'pose_animation_npy', None)
-        self.pose_animation_start_frame = self.get_sim_props_value(sim_props, 'pose_animation_start_frame', 250)
-        self.pose_animation_frame_gap = self.get_sim_props_value(sim_props, 'pose_animation_frame_gap', 3)
-        # End the sim this many frames after the last pose step (gravity is on
-        # during reposing, so the garment is already settled — extra settling
-        # just lets it creep down a tilted pose). Auto-caps max_sim_steps.
-        self.pose_animation_settle_frames = self.get_sim_props_value(sim_props, 'pose_animation_settle_frames', 30)
+        # When the pose steps begin. 'on_static' (the default) arms them the
+        # moment the drape on the loaded pose reaches static equilibrium, so
+        # phase 1 keeps its normal dynamic length instead of being guessed at.
+        # An int pins them to a fixed frame instead (the original behaviour,
+        # which also clamps max_sim_steps to the end of the animation).
+        self.pose_animation_start_frame = self.get_sim_props_value(sim_props, 'pose_animation_start_frame', 'on_static')
+        self.pose_animation_frame_gap = self.get_sim_props_value(sim_props, 'pose_animation_frame_gap', 2)
+        # Frames simulated after the last pose step, after which the run ends.
+        # A fixed count, not a settle: gravity is on throughout the animation,
+        # so the drape stays settled as the body moves and there is nothing to
+        # wait for. The static check is suppressed across the animation and
+        # these frames, since it would otherwise fire between two pose steps.
+        self.pose_animation_settle_frames = self.get_sim_props_value(sim_props, 'pose_animation_settle_frames', 50)
         # Quality filter
         self.max_body_collisions = self.get_sim_props_value(sim_props, 'max_body_collisions', 0)
         self.max_self_collisions = self.get_sim_props_value(sim_props, 'max_self_collisions', 0)

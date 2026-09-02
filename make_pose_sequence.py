@@ -27,7 +27,7 @@ def load_smpl(pkl_path):
     for _name, _val in (('bool', bool), ('int', int), ('float', float),
                         ('complex', complex), ('object', object),
                         ('unicode', str), ('str', str)):
-        if not hasattr(np, _name):
+        if _name not in np.__dict__:
             setattr(np, _name, _val)
     d = pickle.load(open(pkl_path, 'rb'), encoding='latin1')
     Jr = d['J_regressor']
