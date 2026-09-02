@@ -1858,12 +1858,8 @@ class BoxMesh(wrappers.VisPattern):
         # Copy yaml files
         if self.paths.in_design_params.exists():
             shutil.copy(self.paths.in_design_params, self.paths.design_params)
-        # else:
-        #     print(f'{self.__class__.__name__}::{self.name}::WARNING::Path does not exist: {self.paths.in_design_params}')
         if self.paths.in_body_mes.exists():
             shutil.copy(self.paths.in_body_mes, self.paths.body_mes)
-        # else:
-        #     print(f'{self.__class__.__name__}::{self.name}::WARNING::Path does not exist: {self.paths.in_body_mes}')
 
         return log_dir
     # !SECTION

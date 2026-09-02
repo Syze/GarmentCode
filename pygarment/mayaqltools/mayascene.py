@@ -656,7 +656,6 @@ class MayaGarment(wrappers.VisPattern):
                 neighbour_checks += 1
 
                 if len(neighbors) == 0:
-                    # print('Skipped Vertex {} with zero neigbors'.format(unlabeled_vert_id))
                     continue
 
                 unlabelled = [unl[0] for unl in vertices_multi_match]

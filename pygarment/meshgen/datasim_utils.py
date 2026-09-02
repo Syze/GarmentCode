@@ -388,7 +388,6 @@ def _load_boxmesh_timeout(garment, timeout_after):
             raise TimeoutError
         else:
             e_time = time.time() - s_time
-            # print("No timeout error with time: ",e_time)
             signal.alarm(0)
 
 

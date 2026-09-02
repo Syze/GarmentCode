@@ -445,8 +445,6 @@ def run_sim(
                   f'is fail: {num_self_collisions > config.max_self_collisions}')
             if num_self_collisions > config.max_self_collisions:
                 props.add_fail('sim', 'cloth_self_intersection', cloth_name)
-        # else:
-        #     print('Not self-intersecting!!!')
 
     # ---- Postprocessing ----
     # NOTE: Attempt even on failures for accurate picture and post-analysis
@@ -474,7 +472,6 @@ def run_sim(
     render_images(paths, garment.v_body, garment.f_body, render_props['config'])
     render_image_time = time.time() - s_time
     render_props['stats']['render_time'][cloth_name] = render_image_time  
-    #print(f"Rendering {cloth_name} took {render_image_time}s")
 
     # Save simulation video
     if recorder is not None:
@@ -501,4 +498,3 @@ def run_sim(
     # Final info output
     # sec = round(time.time() - start_time, 3)
     # min = int(sec / 60)
-    #print(f"Simulation pipeline took: {min} m {sec - min * 60} s")

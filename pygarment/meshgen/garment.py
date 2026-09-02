@@ -197,12 +197,6 @@ class Cloth:
                                 auto_clearance
                                 + (compressed[mask, 1] - vy_min) * ratio)
                             self._compressed_initial_q = compressed
-                            # print(f'  AUTO PRE-LIFT: hem at Y={vy_min:.2f} '
-                            #       f'below floor — initial-state remap of '
-                            #       f'{mask.sum()} verts in '
-                            #       f'[{vy_min:.1f}, {body_crotch_Y:.1f}] -> '
-                            #       f'[{auto_clearance:.1f}, {body_crotch_Y:.1f}] '
-                            #       f'(compression {1-ratio:.0%}); rest lengths natural')
 
         self.v_cloth_init = cloth_vertices
         self.f_cloth = cloth_faces
