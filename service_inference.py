@@ -13,6 +13,13 @@ dispatcher runs one simulation at a time, each in a fresh spawned child
 process (the sim's frame watchdog hard-exits its process on timeout, and a
 crashed Warp/CUDA context should not poison the server).
 
+Artifacts land in {output}/service/{tryon_id}/, so a run is reconcilable from
+the caller's own identifier without keeping the job_id; the folder holds a
+request.json manifest alongside the sim folder. Requests that omit tryon_id
+fall back to the job_id. A repeat try-on of the same body and garment
+deduplicates onto the earlier job (see _dedup_key) and so produces no sim of
+its own; its tryon_id becomes a symlink to the folder of the job serving it.
+
 Run:
     python service_inference.py --host 0.0.0.0 --port 8600 --gpu 0
 
@@ -21,6 +28,7 @@ Example client:
         "product_id": "1045459",
         "size": "38",
         "body_name": "global_women_size36_apose",
+        "tryon_id": "a3f9c1",
         "sim_props_preset": "default_sim_props"}'
     # -> {"job_id": "...", "status": "pending", "status_url": "/jobs/..."}
     curl localhost:8600/jobs/<job_id>                  # poll until "succeeded"
@@ -33,6 +41,7 @@ import json
 import multiprocessing
 import os
 import queue
+import re
 import signal
 import threading
 import time
@@ -53,6 +62,10 @@ from pydantic import BaseModel
 REPO_ROOT = Path(__file__).resolve().parent
 SERVICE_OUTPUT_DIRNAME = 'service'
 WORKER_RESULT_FILE = 'worker_result.json'
+REQUEST_MANIFEST_FILE = 'request.json'
+# tryon_id becomes a folder name, so it must be a single, unsurprising path
+# segment: no separators, no leading dot, nothing that needs quoting.
+TRYON_ID_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$')
 # Total sim attempts per job: a run that hits max_sim_steps without
 # reaching static equilibrium is retried once from scratch.
 MAX_SIM_ATTEMPTS = 2
@@ -73,6 +86,7 @@ class SimulateRequest(BaseModel):
     product_id: str
     size: str
     body_name: str
+    tryon_id: Optional[str] = None
     sim_props_preset: Optional[str] = None
     sim_props: Optional[dict] = None
     garment_name: Optional[str] = None
@@ -101,11 +115,13 @@ class JobStatus(str, Enum):
 
 class JobInfo(BaseModel):
     job_id: str
+    tryon_id: Optional[str] = None
     status: JobStatus
     created_at: str
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
     request: dict
+    output_folder: Optional[str] = None
     sim_folder: Optional[str] = None
     warnings: List[str] = []
     error: Optional[str] = None
@@ -114,6 +130,7 @@ class JobInfo(BaseModel):
 
 class SubmitResponse(BaseModel):
     job_id: str
+    tryon_id: Optional[str] = None
     status: JobStatus
     status_url: str
     deduplicated: bool = False
@@ -137,14 +154,21 @@ class Job:
     warnings: list = field(default_factory=list)
     error: Optional[str] = None
 
+    @property
+    def tryon_id(self) -> str:
+        """The output folder's name — the caller's id, or the job_id."""
+        return self.output_base.name
+
     def info(self) -> JobInfo:
         return JobInfo(
             job_id=self.id,
+            tryon_id=self.tryon_id,
             status=self.status,
             created_at=self.created_at,
             started_at=self.started_at,
             finished_at=self.finished_at,
             request=self.request,
+            output_folder=str(self.output_base),
             sim_folder=str(self.sim_folder) if self.sim_folder else None,
             warnings=list(self.warnings),
             error=self.error,
@@ -225,6 +249,11 @@ def _attachment_enabled(sim_props) -> bool:
 
 def _validate_request(req: SimulateRequest) -> dict:
     """Resolve and validate a simulate request; returns the worker payload."""
+    if req.tryon_id is not None and not TRYON_ID_RE.match(req.tryon_id):
+        raise HTTPException(
+            422, 'tryon_id must be a single path segment of letters, digits, '
+                 '. _ or -, starting with a letter or digit (max 128 chars)')
+
     sys_config = _load_system_config()
     bodies_path = (REPO_ROOT / sys_config['bodies_default_path']).resolve()
     sim_configs_path = (REPO_ROOT / sys_config['sim_configs_path']).resolve()
@@ -340,6 +369,8 @@ def _validate_request(req: SimulateRequest) -> dict:
         'normalize_body': req.normalize_body,
         'generate_body': generate_body,
         'generate_base': req.body_name,
+        'gender': gender,
+        'tryon_id': req.tryon_id,
         'smpl_model': str(smpl_model),
         'pose_file': str(pose_file),
         'betas': betas,
@@ -354,6 +385,10 @@ def _dedup_key(payload: dict) -> str:
     that feed the sim are unchanged: the spec file and (for presets) the sim
     props file are identified by path+mtime+size, so regenerating a pattern
     or editing a preset automatically yields a new key.
+
+    tryon_id is deliberately absent: it is unique per request, so including it
+    would defeat deduplication entirely. A repeat try-on instead coalesces onto
+    the earlier job and its folder is symlinked there (_alias_tryon_dir).
     """
     def file_stamp(path):
         try:
@@ -371,6 +406,7 @@ def _dedup_key(payload: dict) -> str:
         'normalize_body': payload['normalize_body'],
         'betas': payload.get('betas'),
         'height': payload.get('height'),
+        'gender': payload['gender'] if payload.get('generate_body') else None,
         'sim_props': (file_stamp(payload['sim_props'])
                       if isinstance(payload['sim_props'], str)
                       else payload['sim_props']),
@@ -720,6 +756,46 @@ def _claim_warm_worker(payload: dict, wait_s: float = 20.0):
                 pass
 
 
+def _prepare_output_dir(job):
+    """Create the job's output folder and drop the request manifest in it.
+
+    Done at submit time rather than in _run_job so the folder is there — and
+    findable by tryon_id — while the job is still queued. A symlink left by an
+    earlier deduplicated request is replaced by a real directory, so the new
+    job never writes into the folder it used to point at.
+    """
+    base = job.output_base
+    if base.is_symlink():
+        base.unlink()
+    base.mkdir(parents=True, exist_ok=True)
+    manifest = {'job_id': job.id, 'tryon_id': job.tryon_id,
+                'created_at': job.created_at, 'request': job.request}
+    try:
+        with open(base / REQUEST_MANIFEST_FILE, 'w') as f:
+            json.dump(manifest, f, indent=2, default=str)
+    except OSError as e:
+        print(f'[job {job.id}] could not write {REQUEST_MANIFEST_FILE}: {e}')
+
+
+def _alias_tryon_dir(dirname: str, existing) -> None:
+    """Point dirname at the folder of the job already doing this work.
+
+    A deduplicated request runs no sim and so writes no folder of its own; a
+    relative symlink keeps every tryon_id resolvable on disk anyway, and shows
+    which run served it. Best-effort: the result is still reachable through
+    /jobs/{job_id} if the link cannot be made.
+    """
+    target = existing.output_base
+    link = target.parent / dirname
+    if dirname == target.name or link.is_symlink() or link.exists():
+        return
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        os.symlink(target.name, link, target_is_directory=True)
+    except OSError as e:
+        print(f'[tryon {dirname}] could not link to {target.name}: {e}')
+
+
 def _run_job(mp_ctx, job_id):
     with JOBS_LOCK:
         job = JOBS[job_id]
@@ -844,21 +920,44 @@ def submit_simulation(req: SimulateRequest):
         # Identical work already known? Coalesce onto the in-flight job, or
         # reuse the succeeded result. Failed jobs are never reused, and
         # force=True always re-runs.
+        existing = None
         if not req.force:
-            existing = JOBS.get(KEY_TO_JOB.get(key, ''))
-            if existing is not None and existing.status in (
+            candidate = JOBS.get(KEY_TO_JOB.get(key, ''))
+            if candidate is not None and candidate.status in (
                     JobStatus.pending, JobStatus.running, JobStatus.succeeded):
-                return SubmitResponse(
-                    job_id=existing.id, status=existing.status,
-                    status_url=f'/jobs/{existing.id}', deduplicated=True)
+                existing = candidate
 
-        job_id = uuid.uuid4().hex[:12]
-        output_base = (REPO_ROOT / sys_config['output']).resolve() / SERVICE_OUTPUT_DIRNAME / job_id
-        job = Job(id=job_id, request=req.model_dump(), payload=payload, output_base=output_base)
-        JOBS[job_id] = job
-        KEY_TO_JOB[key] = job_id
+        if existing is None:
+            job_id = uuid.uuid4().hex[:12]
+            dirname = req.tryon_id or job_id
+            # Two live jobs must never share an output folder: _resolve_outcome
+            # reads its subdirectories to decide the outcome, so they would
+            # resolve against each other's meshes. A tryon_id resubmitted while
+            # its first job is still in flight gets a suffixed folder instead.
+            if any(j.output_base.name == dirname
+                   and j.status in (JobStatus.pending, JobStatus.running)
+                   for j in JOBS.values()):
+                dirname = f'{dirname}_{job_id}'
+            output_base = ((REPO_ROOT / sys_config['output']).resolve()
+                           / SERVICE_OUTPUT_DIRNAME / dirname)
+            job = Job(id=job_id, request=req.model_dump(), payload=payload,
+                      output_base=output_base)
+            JOBS[job_id] = job
+            KEY_TO_JOB[key] = job_id
+
+    # Filesystem work stays outside the lock, which the dispatchers also take.
+    if existing is not None:
+        if req.tryon_id:
+            _alias_tryon_dir(req.tryon_id, existing)
+        return SubmitResponse(
+            job_id=existing.id, tryon_id=req.tryon_id or existing.tryon_id,
+            status=existing.status, status_url=f'/jobs/{existing.id}',
+            deduplicated=True)
+
+    _prepare_output_dir(job)
     JOB_QUEUE.put(job_id)
-    return SubmitResponse(job_id=job_id, status=job.status, status_url=f'/jobs/{job_id}')
+    return SubmitResponse(job_id=job_id, tryon_id=job.tryon_id,
+                          status=job.status, status_url=f'/jobs/{job_id}')
 
 
 @app.get('/jobs', response_model=List[JobInfo])
