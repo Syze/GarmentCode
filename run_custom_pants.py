@@ -1253,27 +1253,11 @@ def _apply_pose_x_rotation(folder, body_obj_path,
         return
     (body_top_L, body_top_R), (body_bot_L, body_bot_R) = _lm
 
-    # print(f'  Pose-X-Rot: leg_top_y={leg_top_y:.2f} leg_bot_y={leg_bot_y:.2f} leg_len={leg_length:.2f}')
-    # print(f'    body thigh (v{SMPL_LEG_TOP_VERTS}) L={body_top_L:+.2f} R={body_top_R:+.2f}')
-    # print(f'    body ankle (v{SMPL_LEG_BOT_VERTS}) L={body_bot_L:+.2f} R={body_bot_R:+.2f}')
 
     def pivot_x_for_leg(panel_names):
-        # Average X over the panel's full top (waist) edge. The back-rise scoop
-        # raises ONLY the center-back corner by `back_rise_lift`, tilting the back
-        # waist edge; an exact `v[1] == ymax` test would then pick only that
-        # raised corner and skew the pivot ~half-a-waist toward center-back,
-        # splaying the legs. A Y tolerance spanning the tilt averages the whole
-        # waist edge, giving the true waist-center X — invariant to the scoop
-        # (the lift moves the corner in Y only, never X). tol→0.5 with no scoop,
-        # reproducing the original flat-waist behaviour exactly.
         xs = []
         for n in panel_names:
             p = panels[n]
-            # Only the BACK panel carries the scoop (its waist edge tilts up to
-            # center-back), so only it needs a tolerance spanning the lift. The
-            # FRONT waist is flat — giving it the large tolerance would wrongly
-            # pull in side-seam vertices below the waist and skew the pivot
-            # (seen as a ~2.8cm placement shift at large lifts). Keep front tight.
             tol = (back_rise_lift + 0.5) if n.startswith('pant_b') else 0.5
             ymax = max(v[1] for v in p['vertices'])
             xs.extend(p['translation'][0] + v[0]
@@ -1284,32 +1268,6 @@ def _apply_pose_x_rotation(folder, body_obj_path,
     pivot_R_x = pivot_x_for_leg(['pant_f_r', 'pant_b_r'])
     pivot_y = leg_top_y
 
-    # Shift and rotation are ONE correction and only work as a pair: the shift
-    # puts each leg's waist pivot on the body's thigh X, then rotating by theta
-    # about that pivot swings the hem -- leg_length below it -- sideways by
-    # exactly leg_length * tan(theta) = body_bot - body_top, landing it on the
-    # body's ankle X. Applying the rotation alone leaves the pivot at the
-    # pattern's own X and throws the hem outboard instead (measured on this
-    # body/size: hem 29.73 against an ankle at 24.47, worse than no pose-X at
-    # all). Both numbers come from the pinned SMPL landmarks.
-    # Each panel turns about its OWN crotch vertex to put its hem centre on
-    # that leg's ankle landmark, then both legs shift outward by just enough to
-    # clear the interpenetration the rotation creates.
-    #
-    # The crotch is the pivot because the panels are drafted crotch-at-the-
-    # centreline (a size 44's front panels sit at +0.75..+23.88 and
-    # -23.88..-0.75). The old waist pivot moved the crotch edges laterally, so
-    # any inward correction drove them through each other and extra_x_sep pushed
-    # back by half the overlap -- which was most of the shift. Pivoting at the
-    # crotch leaves the seam itself fixed.
-    #
-    # Measured over 140 service runs, worst-panel hem-centre error against the
-    # ankle: 11.62cm today -> 7.92cm, with interpenetration cleared to the same
-    # -0.10cm gap. The residual is the flat layout: a panel spans crotch to side
-    # seam, so two panels at the same Z cannot both sit on legs 18cm apart and
-    # stay clear, and the clearance shift gives back most of the rotation.
-    # Per-pair (front/back) shifts were tried and gain 0.06cm for a 6cm
-    # front/back seam mismatch -- not worth it.
     def crotch_pivot(n):
         p = panels[n]
         idx = set()
@@ -1354,18 +1312,6 @@ def _apply_pose_x_rotation(folder, body_obj_path,
             pts.append(None)          # edge separator
         return pts
 
-    # Only the part BELOW the crotch can collide: the crotch vertex is the
-    # pivot so it is fixed, and everything above it swings outward, away from
-    # the centreline. The inboard boundary below it is the inseam, the only
-    # thing that moves in. Comparing the panels' WHOLE X extents instead would
-    # report collisions that do not exist -- a panel's extreme X sits near the
-    # crotch while its hem is far inboard of that, and on a size 46 the legs are
-    # 19.8cm apart at the hem against 1.6cm near the crotch.
-    #
-    # Measured against a 41-height sampled version over 9 real service runs:
-    # hem error 0.24cm vs 0.20cm median (a wash) but 2/9 runs left crossing
-    # instead of 6/9, and a smaller worst case (+0.37 vs +0.62cm). Exact rather
-    # than sampled, so nothing can fall between samples.
     def inboard_x(n, want_min):
         cy = pivots[n][1]
         xs = [q[0] for q in panel_outline(n) if q is not None and q[1] <= cy]
@@ -1373,16 +1319,6 @@ def _apply_pose_x_rotation(folder, body_obj_path,
             return None
         return min(xs) if want_min else max(xs)
 
-    # One clearance per PAIR, not one for the whole leg. The front pair and the
-    # back pair sit 45cm apart in Z, so they cannot collide with each other and
-    # their constraints are independent -- and they are very unequal: on
-    # 1045459077 size 46 the back pair overlaps 18.77cm against the front's
-    # 4.18cm, so a shared clearance pushed the front out 9.44cm when it needed
-    # 2.14, costing 7.3cm of front-hem alignment for nothing.
-    #
-    # The cost is that the front and back of one leg no longer move together,
-    # so the inseam and outseam edges start |sepF - sepB| apart (7.3cm on that
-    # run) and the stitches close it during zero-gravity.
     shifts = {}
     sep = 0.0
     for ln, rn in (('pant_f_l', 'pant_f_r'), ('pant_b_l', 'pant_b_r')):
@@ -1405,14 +1341,10 @@ def _apply_pose_x_rotation(folder, body_obj_path,
     # which cancelled the shift it was reacting to. The clearance shift above
     # does the same job against the crotch-pivot transform, once.)
 
-    # print(f'    garment pivots L={pivot_L_x:+.2f} R={pivot_R_x:+.2f}  pivot_y={pivot_y:.2f}')
-    # print(f'    shifts L={shift_L:+.2f} R={shift_R:+.2f}')
-    # print(f'    angles L={math.degrees(theta_L):+.2f}° R={math.degrees(theta_R):+.2f}°')
 
     if not extra_x_sep \
             and abs(math.degrees(theta_L)) < min_angle_deg and abs(math.degrees(theta_R)) < min_angle_deg \
             and abs(shift_L) < 0.5 and abs(shift_R) < 0.5:
-    # print('    below min thresholds; no transform applied')
         return
 
     def apply_rigid(panel, shift_x, theta, pivot_x_world, pivot_y_world=pivot_y):
@@ -1785,7 +1717,6 @@ def simulate_pattern(pattern_folder, garment_name, output_base,
         save_combined_mesh(paths.out_el, body_name=body_name)
     except Exception as e:
         print(f'  Combined mesh skipped: {e}')
-    #print(f'  Simulation complete: {in_name} -> {paths.out_el}')
     return paths.out_el
 
 
@@ -2086,7 +2017,6 @@ def save_combined_mesh(sim_folder, body_obj_path=None, body_name=None):
         for face in garm_f_offset:
             f.write(f"f {face[0]+1} {face[1]+1} {face[2]+1}\n")
 
-    #print(f'  Combined mesh saved to {output_path}')
 
     body.visual = trimesh.visual.ColorVisuals(
         mesh=body, face_colors=np.tile([80, 80, 80, 255], (len(body.faces), 1)))
@@ -2097,7 +2027,6 @@ def save_combined_mesh(sim_folder, body_obj_path=None, body_name=None):
     scene.add_geometry(garment, node_name='garment')
     glb_path = sim_folder / 'combined.glb'
     scene.export(str(glb_path))
-    #print(f'  Combined GLB saved to {glb_path}')
 
 
 # ============================================================
