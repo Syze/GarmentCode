@@ -102,6 +102,11 @@ class SimulateRequest(BaseModel):
     betas: Optional[List[float]] = None
     gender: str = 'female'
     height: Optional[float] = None
+    # Drape on the A-pose body, then animate it into the custom pose during the
+    # sim so the cloth tracks the moving body: a dynamic A-pose drape, a
+    # fixed-length pose animation, then a settle. False drapes straight onto the
+    # static custom-pose body, as the service did before.
+    pose_animate: bool = True
     # Bypass request deduplication: identical requests normally coalesce onto
     # the in-flight job (or reuse the succeeded one); force=True always re-runs.
     force: bool = False
@@ -198,6 +203,7 @@ SERVER_CONFIG = {
     'prewarm': True,
     'max_concurrent': 2,
     'panel_workers': 4,
+    'pose_anim_frames': 90,
 }
 
 
@@ -298,8 +304,11 @@ def _validate_request(req: SimulateRequest) -> dict:
     pose_file = _cfg_path('smpl_poses_dir') / f'{gender}.txt'
     if not body_obj.is_file():
         # Fall back to a generated SMPL body pair ({name}_apose.obj +
-        # {name}_custompose.obj); the custom pose is the one simulated on.
-        sim_body_name = f'{req.body_name}_custompose'
+        # {name}_custompose.obj). A pose_animate run drapes on the A-pose and
+        # is animated into the custom pose during the sim; otherwise the
+        # custom-pose mesh is simulated on directly.
+        sim_body_name = (f'{req.body_name}_apose' if req.pose_animate
+                         else f'{req.body_name}_custompose')
         body_obj = bodies_path / f'{sim_body_name}.obj'
         if not body_obj.is_file():
             if smpl_model.is_file() and pose_file.is_file():
@@ -365,6 +374,8 @@ def _validate_request(req: SimulateRequest) -> dict:
         'generate_base': f'{SERVICE_BODIES_SUBDIR}/{req.body_name}',
         'gender': gender,
         'tryon_id': req.tryon_id,
+        'pose_animate': req.pose_animate,
+        'pose_anim_frames': int(SERVER_CONFIG.get('pose_anim_frames', 90)),
         'smpl_model': str(smpl_model),
         'pose_file': str(pose_file),
         'betas': betas,
@@ -401,6 +412,10 @@ def _dedup_key(payload: dict) -> str:
         'betas': payload.get('betas'),
         'height': payload.get('height'),
         'gender': payload['gender'] if payload.get('generate_body') else None,
+        # Different drape entirely, not just a different body mesh.
+        'pose_animate': payload.get('pose_animate'),
+        'pose_anim_frames': (payload.get('pose_anim_frames')
+                             if payload.get('pose_animate') else None),
         'sim_props': (file_stamp(payload['sim_props'])
                       if isinstance(payload['sim_props'], str)
                       else payload['sim_props']),
@@ -427,6 +442,54 @@ def _collect_fails(sim_folder: Path) -> list:
         return [fail_type for fail_type, names in fails.items() if names]
     except Exception:
         return []
+
+
+def _write_pose_animation(npy_path: Path, model_pkl: str, pose_file: str,
+                          betas=None, height=None, n_frames: int = 90):
+    """Write the A-pose -> custom-pose body sequence the sim animates through.
+
+    (n_frames, 6890, 3) float32 in METRES, frame 0 identical to the _apose.obj
+    the garment is draped on: same betas, same A-pose Y shift, same height
+    scale as _generate_smpl_body, because the sim applies the frames as deltas
+    off the loaded body (garment.py: (seq - seq[0]) * b_scale). A sequence built
+    at a different shape or scale would move the body by the wrong amounts.
+    """
+    import numpy as np
+    from make_pose_sequence import load_smpl, smpl_forward, slerp_pose, THETA_A
+
+    betas = np.asarray(betas if betas is not None else np.zeros(10), dtype=np.float64)
+    model = load_smpl(model_pkl)
+    theta_custom = np.loadtxt(pose_file).reshape(72)
+
+    verts_a = smpl_forward(model, betas, THETA_A)
+    yshift = verts_a[:, 1].min()
+    scale = float(height) / float(verts_a[:, 1].max() - yshift) if height else 1.0
+
+    frames = []
+    for t in np.linspace(0.0, 1.0, n_frames):
+        v = (verts_a if t == 0.0
+             else smpl_forward(model, betas, slerp_pose(THETA_A, theta_custom, t)))
+        frames.append(((v - [0.0, yshift, 0.0]) * scale).astype(np.float32))
+    npy_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(str(npy_path), np.stack(frames))
+    return npy_path
+
+
+def _sim_props_with_pose_animation(sim_props, npy_path: Path):
+    """Copy of sim_props with the pose sequence switched on.
+
+    Accepts either an inline props dict or a preset path (loaded here, since a
+    path cannot carry the per-job npy location). Step spacing and the settle
+    floor are left to the sim's own defaults unless the preset sets them.
+    """
+    import copy
+    if isinstance(sim_props, str):
+        with open(sim_props) as f:
+            sim_props = yaml.safe_load(f)
+    props = copy.deepcopy(sim_props)
+    props.setdefault('sim', {}).setdefault('config', {})[
+        'pose_animation_npy'] = str(npy_path)
+    return props
 
 
 def _generate_smpl_body(base_path: Path, model_pkl: str, pose_file: str,
@@ -562,12 +625,24 @@ def _run_payload(payload: dict):
         if payload['normalize_body']:
             normalize_body_mesh(f"./assets/bodies/{payload['body_name']}.obj")
 
+        sim_props = payload['sim_props']
+        if payload.get('pose_animate'):
+            # Per job rather than cached beside the body: 90 SMPL forwards cost
+            # well under a second against a multi-minute sim, and a per-user
+            # .npy does not have to be kept in step with the body on disk.
+            npy = _write_pose_animation(
+                output_base / 'pose_anim.npy', payload['smpl_model'],
+                payload['pose_file'], betas=payload.get('betas'),
+                height=payload.get('height'),
+                n_frames=int(payload.get('pose_anim_frames', 90)))
+            sim_props = _sim_props_with_pose_animation(sim_props, npy)
+
         sim_folder = simulate_pattern(
             Path(payload['pattern_folder']),
             payload['garment_name'],
             str(output_base),
             body_name=payload['body_name'],
-            sim_props=payload['sim_props'],
+            sim_props=sim_props,
         )
         if sim_folder is None:
             result['error'] = 'No specification file found in pattern folder'

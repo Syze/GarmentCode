@@ -13,8 +13,8 @@ sim:
     max_frame_time: 15
     max_meshgen_time: 60
     max_sim_time: 600
-    static_threshold: 0.06        # per-frame bound, rescaled for sim_fps 30
-    non_static_percent: 1.0
+    static_threshold: 0.08     # is_static() scales it by the readback gap, so at static_check_interval 8 the effective bound is 0.64 cm per vertex per check.
+    non_static_percent: 2
     max_body_collisions: 1000
     max_self_collisions: 5000
     zero_gravity_steps: 75        # counted in frames, rescaled for sim_fps 30

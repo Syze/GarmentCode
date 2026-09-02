@@ -160,6 +160,9 @@ class _VideoRecorder:
     rendering inline stalls the solver for every captured frame. Here the loop
     only hands over a copy of the cloth vertices (cheap) and a worker thread
     renders it, so video capture overlaps the sim instead of extending it.
+    Body vertices ride along, but only on the frames where the body actually
+    moved -- otherwise an animated body would sit frozen in the video while the
+    garment moved around it.
 
     The GL context is created inside the worker and never touched from
     outside it. Rendering failures are swallowed: the video is a diagnostic,
@@ -175,6 +178,7 @@ class _VideoRecorder:
         self.resolution = resolution
         self.frames = []
         self.error = None
+        self._last_body = None
         self._q = queue.Queue(maxsize=queue_max)
         self._thread = threading.Thread(target=self._run, name='VideoRecorder',
                                         daemon=True)
@@ -187,10 +191,15 @@ class _VideoRecorder:
                 item = self._q.get()
                 if item is None:
                     break
+                verts, body = item
                 if renderer is None:
-                    renderer = FrameRenderer(self.body_v, self.body_f,
-                                             self.render_props, self.resolution)
-                self.frames.append(renderer.render(item, self.faces))
+                    # Frame the scene on the body this run starts from.
+                    renderer = FrameRenderer(
+                        self.body_v if body is None else body, self.body_f,
+                        self.render_props, self.resolution)
+                    body = None  # already in the scene; no need to swap it
+                self.frames.append(
+                    renderer.render(verts, self.faces, body_verts=body))
         except BaseException as e:
             self.error = f'{type(e).__name__}: {e}'
         finally:
@@ -200,14 +209,26 @@ class _VideoRecorder:
                 except BaseException:
                     pass
 
-    def submit(self, verts):
-        """Hand a frame to the worker. Copy: the caller reuses its buffer."""
+    def submit(self, verts, body_verts=None):
+        """Hand a frame to the worker. Copy: the caller reuses its buffer.
+
+        The body is only sent when it changed -- pose animation rebinds v_body
+        to a new array per step, so identity is the test -- which keeps a
+        static-body run at one body copy for the whole video.
+        """
         if self.error is not None:
             return
+        send_body = body_verts is not None and body_verts is not self._last_body
+        item = (np.array(verts, copy=True),
+                np.array(body_verts, copy=True) if send_body else None)
         try:
-            self._q.put(np.array(verts, copy=True), timeout=30)
+            self._q.put(item, timeout=30)
         except queue.Full:
-            pass  # renderer fell too far behind; drop the frame, keep simulating
+            return  # renderer fell too far behind; drop the frame, keep simulating
+        # Only after the frame is safely queued: a dropped frame must not make
+        # the next one think the worker has already seen this body.
+        if send_body:
+            self._last_body = body_verts
 
     def finish(self, hold_frames=0):
         """Drain the queue, stop the worker, and return the rendered frames."""
@@ -245,7 +266,10 @@ def sim_frame_sequence(garment, config, store_usd=False, verbose=False,
     _wb_trace = [] if _wb_trace_path else None
 
     start_time = time.time()
-    for frame in range(0, config.max_sim_steps):
+    # A while loop rather than range(): arming the pose animation can raise
+    # config.max_sim_steps, and a range built up front would not see it.
+    frame = 0
+    while frame < config.max_sim_steps:
 
         if verbose:
             print(f'\n------ Frame {frame + 1} ------')
@@ -276,7 +300,7 @@ def sim_frame_sequence(garment, config, store_usd=False, verbose=False,
         # Capture video frame. With a recorder the render happens on a worker
         # thread, so this costs only a vertex readback + copy.
         if recorder is not None and frame % frame_interval == 0:
-            recorder.submit(garment.current_verts)
+            recorder.submit(garment.current_verts, garment.v_body)
         elif video_frames is not None and frame % frame_interval == 0:
             video_frames.append(render_frame_to_array(
                 garment.current_verts, garment.f_cloth,
@@ -295,14 +319,26 @@ def sim_frame_sequence(garment, config, store_usd=False, verbose=False,
                 pass
 
         if (frame >= config.zero_gravity_steps and frame >= config.min_sim_steps
-                and (frame - config.zero_gravity_steps) % config.static_check_interval == 0):
+                and (frame - config.zero_gravity_steps) % config.static_check_interval == 0
+                and not garment.pose_animation_holding(frame)):
             static, _ = garment.is_static()
         if static:
+            # Phase 1 -> 2: the drape has settled, so the body may start moving.
+            # Without a pending animation this is the usual stop.
+            if garment.arm_pose_animation(frame):
+                static = False
+            else:
+                break
+        elif garment.pose_animation_finished(frame):
+            # Phases 2 and 3 are a fixed frame budget rather than a settle, so
+            # the run is simply over here.
             break
 
         runtime = time.time() - start_time
         if runtime > config.max_sim_time:
             raise SimTimeOutError
+
+        frame += 1
 
     if _wb_trace is not None and _wb_trace_path:
         try:
@@ -371,6 +407,13 @@ def run_sim(
 
     config = SimConfig(sim_props['config'])   # Why separate class at all?
     garment = Cloth(cloth_name, config, paths, caching=store_usd)
+
+    try:
+        _body_initial = str(paths.g_sim).replace('_sim.obj', '_body_initial.obj')
+        trimesh.Trimesh(vertices=garment.v_body, faces=garment.f_body,
+                        process=False).export(_body_initial)
+    except Exception as _e:
+        print(f'  body_initial export skipped: {_e}')
 
     # Video capture: interval and resolution are independent of the final
     # still renders -- a 400x400 preview every 15th frame is a perfectly good
@@ -459,9 +502,6 @@ def run_sim(
 
     garment.save_frame(save_v_norms=save_v_norms) #saving after stats
 
-    # Export the FINAL body in the cloth's exact frame, so the combined mesh
-    # uses the body the sim actually ended on (critical when the body was
-    # animated to a new pose — otherwise the on-disk A-pose OBJ is mismatched).
     try:
         _body_final = str(paths.g_sim).replace('_sim.obj', '_body_final.obj')
         trimesh.Trimesh(vertices=garment.v_body, faces=garment.f_body,
@@ -479,7 +519,7 @@ def run_sim(
     # Save simulation video
     if recorder is not None:
         # One last frame of the settled state, then a ~1s hold on it.
-        recorder.submit(garment.current_verts)
+        recorder.submit(garment.current_verts, garment.v_body)
         video_frames = recorder.finish(hold_frames=video_fps - 1)
     elif video_frames:
         # Capture final settled state as extra frames for a brief pause at the end
