@@ -64,9 +64,20 @@ SERVICE_OUTPUT_DIRNAME = 'service'
 SERVICE_BODIES_SUBDIR = 'service'
 WORKER_RESULT_FILE = 'worker_result.json'
 REQUEST_MANIFEST_FILE = 'request.json'
-# tryon_id becomes a folder name, so it must be a single, unsurprising path
-# segment: no separators, no leading dot, nothing that needs quoting.
-TRYON_ID_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$')
+# tryon_id becomes a folder name, so it is coerced to a single unsurprising
+# path segment -- no separators, no leading dot, nothing that needs quoting.
+# Coerced rather than rejected: the caller's id format is not this service's
+# business, and a cosmetic detail in it must never fail a simulation. The
+# mapping is 1:1 and obvious, so "<uuid>#front#<hash>" lands in the folder
+# "<uuid>_front_<hash>" and is still findable from the caller's own id.
+TRYON_ID_UNSAFE_RE = re.compile(r'[^A-Za-z0-9._-]')
+
+
+def _safe_tryon_id(tryon_id):
+    """tryon_id as one path segment, or None if nothing usable survives."""
+    if not tryon_id:
+        return None
+    return TRYON_ID_UNSAFE_RE.sub('_', str(tryon_id)).lstrip('._-')[:128] or None
 # Total sim attempts per job: a run that hits max_sim_steps without
 # reaching static equilibrium is retried once from scratch.
 MAX_SIM_ATTEMPTS = 2
@@ -239,11 +250,6 @@ def _attachment_enabled(sim_props) -> bool:
 
 def _validate_request(req: SimulateRequest) -> dict:
     """Resolve and validate a simulate request; returns the worker payload."""
-    if req.tryon_id is not None and not TRYON_ID_RE.match(req.tryon_id):
-        raise HTTPException(
-            422, 'tryon_id must be a single path segment of letters, digits, '
-                 '. _ or -, starting with a letter or digit (max 128 chars)')
-
     if (not req.body_name or req.body_name in ('.', '..') or '/' in req.body_name or '\\' in req.body_name):
         raise HTTPException(422, 'body_name must be a single path segment')
 
@@ -364,7 +370,7 @@ def _validate_request(req: SimulateRequest) -> dict:
         'generate_body': generate_body,
         'generate_base': f'{SERVICE_BODIES_SUBDIR}/{req.body_name}',
         'gender': gender,
-        'tryon_id': req.tryon_id,
+        'tryon_id': _safe_tryon_id(req.tryon_id),
         'smpl_model': str(smpl_model),
         'pose_file': str(pose_file),
         'betas': betas,
@@ -923,7 +929,7 @@ def submit_simulation(req: SimulateRequest):
 
         if existing is None:
             job_id = uuid.uuid4().hex[:12]
-            dirname = req.tryon_id or job_id
+            dirname = payload['tryon_id'] or job_id
             # Two live jobs must never share an output folder: _resolve_outcome
             # reads its subdirectories to decide the outcome, so they would
             # resolve against each other's meshes. A tryon_id resubmitted while
@@ -941,10 +947,11 @@ def submit_simulation(req: SimulateRequest):
 
     # Filesystem work stays outside the lock, which the dispatchers also take.
     if existing is not None:
-        if req.tryon_id:
-            _alias_tryon_dir(req.tryon_id, existing)
+        if payload['tryon_id']:
+            _alias_tryon_dir(payload['tryon_id'], existing)
         return SubmitResponse(
-            job_id=existing.id, tryon_id=req.tryon_id or existing.tryon_id,
+            job_id=existing.id,
+            tryon_id=payload['tryon_id'] or existing.tryon_id,
             status=existing.status, status_url=f'/jobs/{existing.id}',
             deduplicated=True)
 
