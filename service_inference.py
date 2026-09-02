@@ -4,8 +4,8 @@ Exposes the simulation step of the offline pipeline (run_garment.py ->
 run_custom_pants.simulate_pattern) over HTTP. Requests reference data that
 already exists on disk: a pattern identified by product_id + size (resolved
 to {patterns_root}/{product_id}/{size}/, which must contain a
-*_specification.json), a body under ./assets/bodies (auto-generated from
-SMPL betas/gender when missing), and sim properties (a preset from
+*_specification.json), a body under ./assets/bodies/service (auto-generated
+from SMPL betas/gender when missing), and sim properties (a preset from
 ./assets/Sim_props or an inline dict).
 
 Jobs are asynchronous: POST /simulate returns a job_id immediately; a single
@@ -61,6 +61,7 @@ from pydantic import BaseModel
 
 REPO_ROOT = Path(__file__).resolve().parent
 SERVICE_OUTPUT_DIRNAME = 'service'
+SERVICE_BODIES_SUBDIR = 'service'
 WORKER_RESULT_FILE = 'worker_result.json'
 REQUEST_MANIFEST_FILE = 'request.json'
 # tryon_id becomes a folder name, so it must be a single, unsurprising path
@@ -92,7 +93,7 @@ class SimulateRequest(BaseModel):
     garment_name: Optional[str] = None
     normalize_body: bool = True
     # SMPL body auto-generation (used only when body_name does not already
-    # exist under assets/bodies): shape coefficients (exactly 10 floats;
+    # exist under assets/bodies/service): shape coefficients (exactly 10 floats;
     # default = mean body), gender (selects the SMPL model and the custom
     # pose), and optional target height — the generated mesh is uniformly
     # scaled so its A-pose Y bounding box equals height (metres; values > 3
@@ -191,22 +192,11 @@ WARM_WORKERS: List[dict] = []
 WARM_LOCK = threading.Lock()
 SERVER_CONFIG = {
     'gpu': '0',
-    # Root under which patterns live as {product_id}/{size}/ folders.
-    # Relative paths resolve against the repo root.
     'patterns_root': 'assets/Patterns/service',
-    # Classic SMPL model pkls (SMPL_FEMALE.pkl / SMPL_MALE.pkl) and per-gender
-    # custom pose files ({gender}.txt, 72 axis-angle values), used to
-    # auto-generate missing bodies via the repo's numpy implementation in
-    # make_pose_sequence.py.
     'smpl_models_dir': '../swan-comfyui/Muse/models/smpl',
     'smpl_poses_dir': '../swan-comfyui/Muse/poses_smpl',
-    # Keep spare workers pre-imported and Warp-initialized.
     'prewarm': True,
-    # Simulations to run at once. The GPU is saturated only in bursts and a
-    # single sim uses ~2.4GB of VRAM, so a small amount of overlap raises
-    # throughput markedly; per-job latency rises with it.
     'max_concurrent': 2,
-    # Worker processes for CGAL panel meshing inside each sim (0/1 = serial).
     'panel_workers': 4,
 }
 
@@ -254,8 +244,12 @@ def _validate_request(req: SimulateRequest) -> dict:
             422, 'tryon_id must be a single path segment of letters, digits, '
                  '. _ or -, starting with a letter or digit (max 128 chars)')
 
+    if (not req.body_name or req.body_name in ('.', '..') or '/' in req.body_name or '\\' in req.body_name):
+        raise HTTPException(422, 'body_name must be a single path segment')
+
     sys_config = _load_system_config()
-    bodies_path = (REPO_ROOT / sys_config['bodies_default_path']).resolve()
+    bodies_path = ((REPO_ROOT / sys_config['bodies_default_path']).resolve()
+                   / SERVICE_BODIES_SUBDIR)
     sim_configs_path = (REPO_ROOT / sys_config['sim_configs_path']).resolve()
 
     patterns_root = Path(SERVER_CONFIG['patterns_root'])
@@ -363,12 +357,12 @@ def _validate_request(req: SimulateRequest) -> dict:
         'repo_root': str(REPO_ROOT),
         'gpu': SERVER_CONFIG['gpu'],
         'pattern_folder': str(pattern_folder),
-        'body_name': sim_body_name,
+        'body_name': f'{SERVICE_BODIES_SUBDIR}/{sim_body_name}',
         'garment_name': garment_name,
         'sim_props': sim_props,
         'normalize_body': req.normalize_body,
         'generate_body': generate_body,
-        'generate_base': req.body_name,
+        'generate_base': f'{SERVICE_BODIES_SUBDIR}/{req.body_name}',
         'gender': gender,
         'tryon_id': req.tryon_id,
         'smpl_model': str(smpl_model),
