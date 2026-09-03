@@ -8,10 +8,14 @@ to {patterns_root}/{product_id}/{size}/, which must contain a
 from SMPL betas/gender when missing), and sim properties (a preset from
 ./assets/Sim_props or an inline dict).
 
-Jobs are asynchronous: POST /simulate returns a job_id immediately; a single
-dispatcher runs one simulation at a time, each in a fresh spawned child
-process (the sim's frame watchdog hard-exits its process on timeout, and a
-crashed Warp/CUDA context should not poison the server).
+Jobs are asynchronous: POST /simulate returns a job_id immediately;
+--max-concurrent dispatcher threads each run one simulation at a time, in a
+fresh spawned child process (the sim's frame watchdog hard-exits its process on
+timeout, and a crashed Warp/CUDA context should not poison the server).
+Each job is placed on whichever device in --gpus is running the fewest at the
+time, so concurrent jobs spread across the cards instead of piling onto one.
+A job runs on exactly one GPU -- both its cloth solve (CUDA) and its rendering
+(EGL), which are selected by separate env vars.
 
 Artifacts land in {output}/service/{tryon_id}/, so a run is reconcilable from
 the caller's own identifier without keeping the job_id; the folder holds a
@@ -21,7 +25,7 @@ deduplicates onto the earlier job (see _dedup_key) and so produces no sim of
 its own; its tryon_id becomes a symlink to the folder of the job serving it.
 
 Run:
-    python service_inference.py --host 0.0.0.0 --port 8600 --gpu 0
+    python service_inference.py --host 0.0.0.0 --port 8600 --gpus 0,1
 
 Example client:
     curl -X POST localhost:8600/simulate -H 'Content-Type: application/json' -d '{
@@ -43,6 +47,8 @@ import os
 import queue
 import re
 import signal
+import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -170,6 +176,11 @@ class Job:
     sim_folder: Optional[Path] = None
     warnings: list = field(default_factory=list)
     error: Optional[str] = None
+    requeues: int = 0
+    # Device of the most recent attempt, so a requeued job can be steered away
+    # from the one that just failed it.
+    last_gpu: Optional[str] = None
+    prior_failures: list = field(default_factory=list)
 
     @property
     def tryon_id(self) -> str:
@@ -201,18 +212,33 @@ STOP_EVENT = threading.Event()
 # job_id -> Process, for the jobs currently simulating (up to max_concurrent).
 ACTIVE_PROCESSES: Dict[str, object] = {}
 ACTIVE_LOCK = threading.Lock()
-# Pre-warmed spare workers, each {'proc', 'conn'}: already imported and
+# Pre-warmed spare workers, each {'proc', 'conn', 'gpu'}: already imported and
 # Warp-initialised, blocked on a pipe. Topped up while jobs run, so the
-# import + CUDA-init cost is paid off the critical path.
+# import + CUDA-init cost is paid off the critical path. Tagged with the
+# device they warmed on -- CUDA_VISIBLE_DEVICES is fixed before the Warp
+# import, so a spare can only ever serve a dispatcher on that same GPU.
 WARM_WORKERS: List[dict] = []
 WARM_LOCK = threading.Lock()
+# Sims per device. Concurrency scales with the hardware by default, so this
+# is what --max-concurrent works out to unless it is given explicitly.
+PER_GPU_CONCURRENCY = 3
+# Consecutive jobs a device may fail without producing anything before the log
+# calls it out. Not a cutoff: a device is never retired from rotation, because
+# a systemic fault (an unreadable patterns root, say) fails every device alike
+# and would silently take the whole service out of service.
+DEVICE_FAILURE_ALERT = 3
+# gpu -> consecutive no-output failures. Guarded by JOBS_LOCK.
+GPU_FAILURES: Dict[str, int] = {}
+# gpu -> sims running on it right now. Guarded by ACTIVE_LOCK.
+GPU_LOAD: Dict[str, int] = {}
 SERVER_CONFIG = {
-    'gpu': '0',
+    # CUDA_VISIBLE_DEVICES values sim workers may use, from --gpus.
+    'gpus': ['0'],
     'patterns_root': 'assets/Patterns/service',
     'smpl_models_dir': '../swan-comfyui/Muse/models/smpl',
     'smpl_poses_dir': '../swan-comfyui/Muse/poses_smpl',
     'prewarm': True,
-    'max_concurrent': 2,
+    'max_concurrent': PER_GPU_CONCURRENCY,
     'panel_workers': 4,
     'pose_anim_frames': 60,
 }
@@ -370,7 +396,6 @@ def _validate_request(req: SimulateRequest) -> dict:
 
     return {
         'repo_root': str(REPO_ROOT),
-        'gpu': SERVER_CONFIG['gpu'],
         'pattern_folder': str(pattern_folder),
         'body_name': f'{SERVICE_BODIES_SUBDIR}/{sim_body_name}',
         'garment_name': garment_name,
@@ -537,15 +562,104 @@ def _generate_smpl_body(base_path: Path, model_pkl: str, pose_file: str,
         print(f'  Generated SMPL body: {path}')
 
 
+# The NV driver tags each EGL device with the CUDA index of the card behind
+# it, which is the only reliable way to line the two enumerations up.
+EGL_CUDA_DEVICE_NV = 0x323A
+
+
+def _pin_worker_devices(gpu: str):
+    """Point this process's CUDA *and* GL work at device `gpu`.
+
+    CUDA_VISIBLE_DEVICES pins only the Warp cloth solve. Rendering goes
+    through pyrender/EGL, which takes its device from EGL_DEVICE_ID and
+    enumerates every device on the box regardless of the CUDA mask -- so
+    without this, --gpus splits the solver across cards while every worker's
+    GL context and frame rendering piles onto EGL device 0. That is not a
+    corner case: save_sim_video defaults to True (run_custom_pants.py) and no
+    preset in assets/Sim_props overrides it, so every service job renders.
+
+    The index set here is the identity guess; _refine_egl_device() corrects it
+    once forking is done. Env only, so this is safe to call before a fork.
+    """
+    os.environ['CUDA_VISIBLE_DEVICES'] = gpu
+    # CUDA orders devices FASTEST_FIRST by default and EGL does not; bus order
+    # is the one enumeration both can agree on.
+    os.environ.setdefault('CUDA_DEVICE_ORDER', 'PCI_BUS_ID')
+    if sys.platform.startswith('linux'):
+        # The platform pygarment.meshgen.render.pythonrender selects at import
+        # anyway; set early so the device query below loads the EGL plugin.
+        os.environ.setdefault('PYOPENGL_PLATFORM', 'egl')
+        # Only an index is a usable guess -- pyrender does int() on this, so a
+        # UUID device id would crash the renderer. Those are left for
+        # _refine_egl_device to resolve properly, or to pyrender's own
+        # default if it cannot.
+        if gpu.isdigit():
+            os.environ['EGL_DEVICE_ID'] = gpu
+
+
+def _refine_egl_device(gpu: str):
+    """Correct EGL_DEVICE_ID to the EGL device sitting on this worker's card.
+
+    EGL lists more devices than the box has GPUs (software entries included)
+    and in its own order, so the index meaning "GPU 3" to CUDA need not mean
+    GPU 3 to EGL. The driver tags each EGL device with a CUDA index, but it
+    reports it *through the mask* that _pin_worker_devices has already
+    applied: with CUDA_VISIBLE_DEVICES narrowed to one device, that device is
+    the only one that answers, and it calls itself CUDA 0 whichever card it
+    physically is. So the match is against 0, not against `gpu` -- matching
+    `gpu` would only ever succeed for GPU 0 and warn spuriously everywhere
+    else. This also keeps UUID device ids working, which int(gpu) would not.
+
+    Where the query is unavailable the identity guess stands, which is right
+    whenever the box is homogeneous and every EGL device is a GPU. Best-effort
+    throughout: rendering is a diagnostic and a mapping failure must never
+    fail a job.
+
+    Runs after the panel pool has forked -- the query loads EGL and its driver
+    libraries, which the forked children have no use for.
+    """
+    if not sys.platform.startswith('linux'):
+        return
+    guess = os.environ.get('EGL_DEVICE_ID')
+    try:
+        import ctypes
+        from pyrender.platforms import egl as _egl
+        query_attrib = _egl._get_egl_func('eglQueryDeviceAttribEXT',
+                                          _egl.egl.EGLBoolean)
+        if query_attrib is None:
+            return
+        for index, device in enumerate(_egl.query_devices()):
+            value = ctypes.c_ssize_t(-1)
+            if not query_attrib(device._display, EGL_CUDA_DEVICE_NV,
+                                ctypes.byref(value)):
+                continue
+            # The one device the mask left visible, whatever card that is.
+            if value.value == 0:
+                os.environ['EGL_DEVICE_ID'] = str(index)
+                if guess is None:
+                    print(f'[worker] rendering on EGL device {index} (CUDA {gpu})')
+                elif str(index) != guess:
+                    print(f'[worker] rendering on EGL device {index} '
+                          f'(CUDA {gpu}); index guess {guess} was wrong')
+                return
+        print(f'[worker] no EGL device answered for CUDA {gpu}; rendering '
+              f'stays on EGL device {guess if guess is not None else 0} -- '
+              'confirm with nvidia-smi that no render memory lands on GPU 0')
+    except Exception as e:
+        print(f'[worker] EGL/CUDA device mapping unavailable ({e}); rendering '
+              f'stays on EGL device {guess if guess is not None else 0}')
+
+
 def _sim_worker_entry(payload: dict):
     """Cold child process entry point. Must stay a top-level function (spawn)."""
-    # Must be set before importing run_custom_pants (it setdefault's GPU 1)
-    # and before Warp initializes.
-    os.environ['CUDA_VISIBLE_DEVICES'] = payload['gpu']
+    # Both device vars must be set before Warp initializes and before pyrender
+    # builds its GL context.
+    _pin_worker_devices(payload['gpu'])
     os.chdir(payload['repo_root'])
     if payload.get('panel_workers'):
         from pygarment.meshgen import boxmeshgen
         boxmeshgen.init_panel_pool(payload['panel_workers'])
+    _refine_egl_device(payload['gpu'])
     _run_payload(payload)
 
 
@@ -560,7 +674,7 @@ def _warm_worker_entry(conn, gpu: str, repo_root: str, panel_workers: int = 0):
     exits, so a poisoned Warp/CUDA context or a watchdog os._exit() cannot
     leak into the next one.
     """
-    os.environ['CUDA_VISIBLE_DEVICES'] = gpu
+    _pin_worker_devices(gpu)
     os.chdir(repo_root)
     try:
         # Panel-meshing pool first: it fork()s, and forking a process that
@@ -568,6 +682,7 @@ def _warm_worker_entry(conn, gpu: str, repo_root: str, panel_workers: int = 0):
         # import below keeps the children clean.
         from pygarment.meshgen import boxmeshgen
         boxmeshgen.init_panel_pool(panel_workers)
+        _refine_egl_device(gpu)
 
         # Shutdown terminates idle spares, and this one spends its life
         # blocked in conn.recv(). SIGTERM's default handler would take it out
@@ -741,15 +856,88 @@ def _resolve_outcome(job: Job, exitcode: Optional[int], ignore_dirs=()):
         job.error = 'Simulation finished without producing combined.obj'
 
 
+def _available_cuda_devices():
+    """Device indices nvidia-smi reports, or None if it cannot be asked.
+
+    Guards against a typo'd --gpus. An unusable id is otherwise discovered
+    only inside a child process, one failed job at a time -- and because a
+    device that fails instantly looks idle, least-loaded placement would keep
+    feeding it until the failure streak sinks it. Queried with the
+    CUDA mask stripped so the server's own CUDA_VISIBLE_DEVICES cannot narrow
+    what it sees, and index order matches CUDA's because workers pin
+    CUDA_DEVICE_ORDER=PCI_BUS_ID.
+    """
+    env = {k: v for k, v in os.environ.items() if k != 'CUDA_VISIBLE_DEVICES'}
+    try:
+        probe = subprocess.run(
+            ['nvidia-smi', '--query-gpu=index', '--format=csv,noheader'],
+            capture_output=True, text=True, timeout=15, env=env)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if probe.returncode != 0:
+        return None
+    return [line.strip() for line in probe.stdout.splitlines() if line.strip()]
+
+
+def _gpu_capacity(gpu: str) -> int:
+    """Sims this device can be asked to run at once: max_concurrent split
+    across --gpus, the remainder going to the first devices listed. Only sizes
+    the warm pool -- placement itself is by live load, not by quota."""
+    gpus = SERVER_CONFIG['gpus']
+    n, share = SERVER_CONFIG['max_concurrent'], SERVER_CONFIG['max_concurrent'] // len(gpus)
+    return share + (1 if gpus.index(gpu) < n % len(gpus) else 0)
+
+
+def _claim_gpu(avoid: Optional[str] = None) -> str:
+    """Pick the device for one job: the one running the fewest right now.
+
+    Placement is per job rather than per dispatcher. With a shared queue and
+    threads pinned for life, which card a job landed on came down to which
+    thread happened to have waited longest -- so two jobs could both take GPU
+    0 while GPU 1 sat idle. Choosing the least-loaded device here spreads them
+    by construction (loads never differ by more than one) and keeps spreading
+    them as jobs finish at uneven times.
+
+    A device on a consecutive-failure streak sorts last, because a wedged card
+    fails jobs instantly and so looks permanently idle -- exactly the thing
+    least-loaded placement would otherwise pile work onto. It is never taken
+    out of rotation: the streak resets on the first success, and a device that
+    is the only option is still used.
+
+    `avoid` steers a requeued job off the device that just failed it.
+    """
+    gpus = SERVER_CONFIG['gpus']
+    # Plain int reads of a dict that only ever gets whole-value updates; worth
+    # no lock, and a stale count only costs one slightly uneven placement.
+    suspect = {g: GPU_FAILURES.get(g, 0) >= DEVICE_FAILURE_ALERT for g in gpus}
+    with ACTIVE_LOCK:
+        options = [g for g in gpus if g != avoid] or gpus
+        gpu = min(options, key=lambda g: (suspect[g], GPU_LOAD.get(g, 0),
+                                          gpus.index(g)))
+        GPU_LOAD[gpu] = GPU_LOAD.get(gpu, 0) + 1
+    return gpu
+
+
+def _release_gpu(gpu: str) -> None:
+    with ACTIVE_LOCK:
+        GPU_LOAD[gpu] = max(0, GPU_LOAD.get(gpu, 0) - 1)
+
+
 def _dispatcher_loop():
     mp_ctx = multiprocessing.get_context('spawn')
-    _spawn_warm_worker(mp_ctx)
+    for gpu in SERVER_CONFIG['gpus']:
+        _spawn_warm_worker(mp_ctx, gpu)
     while not STOP_EVENT.is_set():
         job_id = JOB_QUEUE.get()
         if job_id is None:
             break
+        with JOBS_LOCK:
+            job = JOBS.get(job_id)
+            # A requeued job carries the device that already failed it.
+            avoid = job.last_gpu if job is not None else None
+        gpu = _claim_gpu(avoid)
         try:
-            _run_job(mp_ctx, job_id)
+            _run_job(mp_ctx, job_id, gpu)
         except Exception:
             # A dispatcher bug must never kill the thread — later jobs would
             # queue forever. Mark the job failed and keep serving.
@@ -762,26 +950,33 @@ def _dispatcher_loop():
                     job.finished_at = datetime.now().isoformat(timespec='seconds')
             with ACTIVE_LOCK:
                 ACTIVE_PROCESSES.pop(job_id, None)
+        finally:
+            _release_gpu(gpu)
 
 
-def _spawn_warm_worker(mp_ctx, target=None):
-    """Top the spare pool up to `target` workers. Non-blocking: readiness is
-    checked when a spare is claimed."""
+def _spawn_warm_worker(mp_ctx, gpu, target=None):
+    """Top the spare pool for `gpu` up to `target` workers. Non-blocking:
+    readiness is checked when a spare is claimed.
+
+    The pool is counted per device, not globally: a spare is bound to the GPU
+    it initialised CUDA on, so one warmed on GPU 0 is useless to a job placed
+    on GPU 1. The default target is that device's share of max_concurrent, so
+    every sim it can be asked to run has a spare waiting."""
     if not SERVER_CONFIG.get('prewarm', True):
         return
     if target is None:
-        target = SERVER_CONFIG['max_concurrent']
+        target = _gpu_capacity(gpu)
     # Count and spawn under one lock: two dispatchers topping up at the same
     # time would otherwise both see an empty pool and each fill it.
     with WARM_LOCK:
         WARM_WORKERS[:] = [w for w in WARM_WORKERS if w['proc'].is_alive()]
-        missing = max(0, target - len(WARM_WORKERS))
+        missing = max(0, target - sum(w['gpu'] == gpu for w in WARM_WORKERS))
         for _ in range(missing):
             try:
                 parent, child = mp_ctx.Pipe()
                 proc = mp_ctx.Process(
                     target=_warm_worker_entry,
-                    args=(child, SERVER_CONFIG['gpu'], str(REPO_ROOT),
+                    args=(child, gpu, str(REPO_ROOT),
                           SERVER_CONFIG.get('panel_workers', 0)),
                     # NOT daemonic: the worker forks its own panel-meshing
                     # pool, and a daemonic process is forbidden children.
@@ -790,21 +985,23 @@ def _spawn_warm_worker(mp_ctx, target=None):
                 )
                 proc.start()
                 child.close()
-                WARM_WORKERS.append({'proc': proc, 'conn': parent})
+                WARM_WORKERS.append({'proc': proc, 'conn': parent, 'gpu': gpu})
             except Exception:
-                print(f'[prewarm] could not start spare worker:\n'
+                print(f'[prewarm] could not start spare worker on GPU {gpu}:\n'
                       f'{traceback.format_exc()}')
                 return
 
 
-def _claim_warm_worker(payload: dict, wait_s: float = 20.0):
-    """Hand the payload to a spare worker. Returns the process, or None if no
-    usable spare exists (the caller then falls back to a cold spawn)."""
+def _claim_warm_worker(payload: dict, gpu: str, wait_s: float = 20.0):
+    """Hand the payload to a spare worker warmed on `gpu`. Returns the process,
+    or None if no usable spare exists for that device (the caller then falls
+    back to a cold spawn)."""
     while True:
         with WARM_LOCK:
-            if not WARM_WORKERS:
+            slot = next((w for w in WARM_WORKERS if w['gpu'] == gpu), None)
+            if slot is None:
                 return None
-            slot = WARM_WORKERS.pop(0)
+            WARM_WORKERS.remove(slot)
         proc, conn = slot['proc'], slot['conn']
         if not proc.is_alive():
             continue
@@ -871,11 +1068,12 @@ def _alias_tryon_dir(dirname: str, existing) -> None:
         print(f'[tryon {dirname}] could not link to {target.name}: {e}')
 
 
-def _run_job(mp_ctx, job_id):
+def _run_job(mp_ctx, job_id, gpu: str):
     with JOBS_LOCK:
         job = JOBS[job_id]
         job.status = JobStatus.running
         job.started_at = datetime.now().isoformat(timespec='seconds')
+        job.last_gpu = gpu
 
     job.output_base.mkdir(parents=True, exist_ok=True)
     t_start = time.monotonic()
@@ -885,9 +1083,12 @@ def _run_job(mp_ctx, job_id):
         stale_dirs = {p.name for p in job.output_base.iterdir() if p.is_dir()}
         (job.output_base / WORKER_RESULT_FILE).unlink(missing_ok=True)
 
+        # The GPU is stamped here rather than at validation time: which
+        # device a job lands on is decided by which dispatcher picks it up.
         payload = {**job.payload, 'output_base': str(job.output_base),
+                   'gpu': gpu,
                    'panel_workers': SERVER_CONFIG.get('panel_workers', 0)}
-        proc = _claim_warm_worker(payload)
+        proc = _claim_warm_worker(payload, gpu)
         if proc is None:
             proc = mp_ctx.Process(
                 target=_sim_worker_entry, args=(payload,), daemon=False)
@@ -895,7 +1096,7 @@ def _run_job(mp_ctx, job_id):
         with ACTIVE_LOCK:
             ACTIVE_PROCESSES[job_id] = proc
         # Top the spare pool back up now, so it imports while this job simulates.
-        _spawn_warm_worker(mp_ctx)
+        _spawn_warm_worker(mp_ctx, gpu)
         proc.join()
         with ACTIVE_LOCK:
             ACTIVE_PROCESSES.pop(job_id, None)
@@ -924,9 +1125,48 @@ def _run_job(mp_ctx, job_id):
               f'without static equilibrium — retrying')
 
     with JOBS_LOCK:
+        # Nothing on disk at all points at the device rather than the inputs:
+        # on a wedged GPU the spares die at import and the cold spawn fails
+        # the same way. Dispatchers are pinned for life, so leaving the job
+        # here would fail this device's whole share of the queue; one requeue
+        # lets another dispatcher try it elsewhere. Bounded to one, so a job
+        # that is genuinely bad still reaches a terminal state.
+        produced_nothing = (job.status == JobStatus.failed
+                            and job.sim_folder is None)
+        # Consecutive failures are the signal that the device itself is gone,
+        # rather than this one job being bad.
+        GPU_FAILURES[gpu] = GPU_FAILURES.get(gpu, 0) + 1 if produced_nothing else 0
+        wedged = produced_nothing and GPU_FAILURES[gpu] >= DEVICE_FAILURE_ALERT
+        requeue = (produced_nothing
+                   and job.requeues < 1
+                   and len(SERVER_CONFIG['gpus']) > 1
+                   and not STOP_EVENT.is_set())
+        if requeue:
+            job.requeues += 1
+            # Kept for the response: the retry runs on another device and may
+            # fail for an entirely different reason, and the caller should not
+            # be shown only the second one.
+            job.prior_failures.append(f'GPU {gpu}: {job.error}')
+            job.status = JobStatus.pending
+            job.started_at = None
+            job.error = None
+            job.warnings = []
+    if wedged:
+        print(f'[warn] GPU {gpu} has failed {GPU_FAILURES[gpu]} consecutive '
+              'jobs without producing output — check the device (it stays in '
+              'rotation; jobs are retried on the others)')
+    if requeue:
+        print(f'[job {job_id}] produced no output on GPU {gpu} — requeueing '
+              'once for another device')
+        JOB_QUEUE.put(job_id)
+        return
+
+    with JOBS_LOCK:
+        if job.prior_failures and job.status == JobStatus.failed:
+            job.error = '; '.join([*job.prior_failures, f'GPU {gpu}: {job.error}'])
         job.finished_at = datetime.now().isoformat(timespec='seconds')
     elapsed = time.monotonic() - t_start
-    print(f'[job {job_id}] {job.status.value}'
+    print(f'[job {job_id}] {job.status.value} on GPU {gpu}'
           f' in {int(elapsed // 60)}m {elapsed % 60:.1f}s'
           + (f' — {job.error}' if job.error else '')
           + '\n\n')
@@ -946,7 +1186,10 @@ async def lifespan(app: FastAPI):
     ]
     for d in dispatchers:
         d.start()
-    print(f'Dispatchers: {n} concurrent · prewarm='
+    per_gpu = ', '.join(f'GPU {g}: up to {_gpu_capacity(g)}'
+                        for g in SERVER_CONFIG['gpus'])
+    print(f'Dispatchers: {n} concurrent, placed on the least-loaded device '
+          f'({per_gpu}) · prewarm='
           f"{SERVER_CONFIG['prewarm']} · panel_workers="
           f"{SERVER_CONFIG.get('panel_workers')}")
     yield
@@ -982,6 +1225,9 @@ def health():
         'running_job': next(iter(ACTIVE_PROCESSES), None),
         'running_jobs': list(ACTIVE_PROCESSES),
         'max_concurrent': SERVER_CONFIG['max_concurrent'],
+        'gpus': SERVER_CONFIG['gpus'],
+        'gpu_load': {g: GPU_LOAD.get(g, 0) for g in SERVER_CONFIG['gpus']},
+        'gpu_capacity': {g: _gpu_capacity(g) for g in SERVER_CONFIG['gpus']},
     }
 
 
@@ -1079,8 +1325,10 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='GarmentCode draping inference server')
     parser.add_argument('--host', default='0.0.0.0')
     parser.add_argument('--port', type=int, default=8600)
-    parser.add_argument('--gpu', default=os.environ.get('CUDA_VISIBLE_DEVICES', '0'),
-                        help='CUDA_VISIBLE_DEVICES value for sim worker processes '
+    parser.add_argument('--gpus', '--gpu', default=None,
+                        help='CUDA device(s) for sim worker processes, comma-separated '
+                             '(e.g. "0,1"). Dispatchers are pinned to them round-robin, '
+                             'so --gpus 0,1 --max-concurrent 4 runs two sims per device '
                              '(defaults to the CUDA_VISIBLE_DEVICES the server was started with, else 0)')
     parser.add_argument('--smpl-models-dir', default=SERVER_CONFIG['smpl_models_dir'],
                         help='Directory with SMPL_FEMALE.pkl / SMPL_MALE.pkl')
@@ -1088,9 +1336,10 @@ if __name__ == '__main__':
                         help='Directory with per-gender custom pose files ({gender}.txt)')
     parser.add_argument('--no-prewarm', action='store_true',
                         help='Do not keep pre-warmed spare sim workers')
-    parser.add_argument('--max-concurrent', type=int,
-                        default=SERVER_CONFIG['max_concurrent'],
-                        help='Simulations to run concurrently (default 2)')
+    parser.add_argument('--max-concurrent', type=int, default=None,
+                        help='Simulations to run concurrently, placed on the '
+                             f'least-loaded device (default: '
+                             f'{PER_GPU_CONCURRENCY} per GPU in --gpus)')
     parser.add_argument('--panel-workers', type=int,
                         default=SERVER_CONFIG['panel_workers'],
                         help='Processes for CGAL panel meshing per sim (0=serial)')
@@ -1098,12 +1347,50 @@ if __name__ == '__main__':
                         help='Root folder holding patterns as {product_id}/{size}/')
     args = parser.parse_args()
 
-    SERVER_CONFIG['gpu'] = args.gpu
+    env_gpus = os.environ.get('CUDA_VISIBLE_DEVICES')
+    gpus = [g.strip() for g in (args.gpus if args.gpus is not None
+                                else (env_gpus or '0')).split(',') if g.strip()]
+    gpus = gpus or ['0']
+    if args.gpus is None and len(gpus) > 1:
+        # Worth saying out loud: this env var used to mask one worker down to
+        # a set of devices, and now names the devices to spread across.
+        print(f'[info] no --gpus given; reading CUDA_VISIBLE_DEVICES={env_gpus} '
+              f'as {len(gpus)} devices to dispatch across')
+    # UUID device ids are legal in CUDA_VISIBLE_DEVICES and nvidia-smi reports
+    # indices, so only numeric ids can be checked against it.
+    available = _available_cuda_devices()
+    if available is not None:
+        unknown = [g for g in gpus if g.isdigit() and g not in available]
+        if unknown:
+            print(f'[warn] --gpus names device(s) {unknown} that nvidia-smi '
+                  f'does not report (it sees {available}) — dropping them, '
+                  'they would have failed their whole share of the queue')
+            gpus = [g for g in gpus if g not in unknown]
+        if not gpus:
+            parser.error(f'no usable device in --gpus; nvidia-smi sees {available}')
+    SERVER_CONFIG['gpus'] = gpus
     SERVER_CONFIG['smpl_models_dir'] = args.smpl_models_dir
     SERVER_CONFIG['smpl_poses_dir'] = args.smpl_poses_dir
     SERVER_CONFIG['patterns_root'] = args.patterns_root
     SERVER_CONFIG['prewarm'] = not args.no_prewarm
-    SERVER_CONFIG['max_concurrent'] = max(1, args.max_concurrent)
+    # Unset, concurrency follows the hardware. An explicit value is respected
+    # as given -- including one below the device count, which is a legitimate
+    # if odd choice and warned about below.
+    SERVER_CONFIG['max_concurrent'] = max(
+        1, args.max_concurrent if args.max_concurrent is not None
+        else PER_GPU_CONCURRENCY * len(gpus))
+    if SERVER_CONFIG['max_concurrent'] < len(gpus):
+        # Fewer slots than devices: the trailing ones get no share of
+        # max_concurrent and so no warm pool, and placement reaches them only
+        # in the tie no running job can produce. Effectively unused.
+        print(f'[warn] --max-concurrent {SERVER_CONFIG["max_concurrent"]} < '
+              f'{len(gpus)} GPUs: {gpus[SERVER_CONFIG["max_concurrent"]:]} will '
+              'go effectively unused')
+    elif len(gpus) > 1 and SERVER_CONFIG['max_concurrent'] % len(gpus):
+        split = ', '.join(f'GPU {g}: {_gpu_capacity(g)}' for g in gpus)
+        print(f'[warn] {SERVER_CONFIG["max_concurrent"]} slots over {len(gpus)} '
+              f'GPUs divides unevenly ({split}); use a multiple of {len(gpus)} '
+              'to size the warm pools evenly')
     SERVER_CONFIG['panel_workers'] = args.panel_workers
     os.chdir(REPO_ROOT)
     # No per-request access log: polling clients hit /jobs every second and
