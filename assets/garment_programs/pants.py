@@ -768,7 +768,3 @@ class Pants(BaseBottoms):
     
     def length(self):
         return self.right.length()
-
-
-# GT-driven pants (opt-in via meta.bottom == PantsCLO); see pants_clo.py
-from assets.garment_programs.pants_clo import PantsCLO, PantsHalfCLO, PantPanelCLO
